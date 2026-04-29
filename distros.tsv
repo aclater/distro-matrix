@@ -17,6 +17,7 @@ centos-stream-10	rhel	centos	centos/CentOS-Stream-GenericCloud-x86_64-10-2026042
 fedora-44	rhel	fedora	fedora/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
 ubuntu-24.04	debian	ubuntu	ubuntu/ubuntu-24.04-server-cloudimg-amd64.img
 ubuntu-25.10	debian	ubuntu	ubuntu/ubuntu-25.10-server-cloudimg-amd64.img
-debian-12	debian	debian	debian/debian-12-genericcloud-amd64.qcow2
+# debian-12 hangs at boot — see https://github.com/aclater/distro-matrix/issues/3
+# debian-12	debian	debian	debian/debian-12-genericcloud-amd64.qcow2
 debian-13	debian	debian	debian/debian-13-genericcloud-amd64.qcow2
 # sles-15	suse	sles	sles/<populate after manual SCC download>
