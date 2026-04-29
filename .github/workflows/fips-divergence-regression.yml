@@ -1,0 +1,83 @@
+name: FIPS algorithm-fence divergence regression
+
+# Boots a 2-VM fleet under FIPS — one RHEL 10, one rebuild distro 10 —
+# runs pqc_readiness.py --json on each, and asserts the divergence
+# documented in pqc-readiness/docs/findings/fips-algorithm-fence.md
+# still holds:
+#   - RHEL FIPS-on must report zero PQC KEMs and zero PQC signatures
+#   - rebuild FIPS-on must report a non-zero count of either
+#
+# Either failure is interesting:
+#   - RHEL exposing PQC algorithms: regression in RHEL's gating patches
+#   - rebuild not exposing them:    rebuild started carrying gating
+#                                   patches; relax the test or update
+#                                   the writeup
+#
+# This workflow does not run on every PR — libvirt + a self-hosted
+# runner are the assumption.  Triggers: weekly schedule + on-demand.
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays 07:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  fips-divergence:
+    name: FIPS divergence (RHEL vs rebuild)
+    runs-on: [self-hosted, libvirt]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout distro-matrix
+        uses: actions/checkout@v6.0.2
+
+      - name: Checkout pqc-readiness alongside
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: aclater/pqc-readiness
+          path: pqc-readiness
+
+      - name: Boot 2-VM FIPS fleet
+        run: |
+          cat > fleet.tsv <<'EOF'
+          rhel-10    1
+          rocky-10   1
+          EOF
+          ./scripts/spawn-fleet/spawn-fleet.sh \
+            --manifest ./fleet.tsv \
+            --memory 18432 \
+            --vcpus 2 \
+            --fips \
+            --results-dir ./fleet-fips/
+
+      - name: Run pqc_readiness.py on every host
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r vm alias family expected ip; do
+            [[ -z $vm || $ip == FAIL ]] && continue
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                pqc-readiness/pqc_readiness.py "matrix@$ip:/tmp/"
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                "matrix@$ip" "sudo python3 /tmp/pqc_readiness.py --json" \
+                > "./fleet-fips/$vm/result.json"
+          done < ./fleet-fips/fleet.tsv
+
+      - name: Assert FIPS algorithm-fence divergence
+        run: ./scripts/check-fips-divergence.py ./fleet-fips/
+
+      - name: Upload result.json artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fleet-results
+          path: |
+            ./fleet-fips/**/result.json
+            ./fleet-fips/fleet.tsv
+            ./fleet-fips/inventory.ini
+
+      - name: Teardown fleet
+        if: always()
+        run: ./scripts/teardown-fleet.sh --results-dir ./fleet-fips/
