@@ -223,6 +223,9 @@ boot_one() {
     >>"$out_dir/virt.log" 2>&1
 
   log "[$vm] virt-install"
+  # shellcheck disable=SC2024  # unprivileged user owns virt.log; the
+  # sudo'd subprocess inherits the FD opened by the parent shell, so
+  # the redirect lands in the right file with the right ownership.
   if ! sudo virt-install \
         --connect "$LIBVIRT_URI" \
         --name "$vm" \
@@ -259,6 +262,9 @@ boot_one() {
   # before reboot returns success but the host is about to drop the connection.
   local ready_check='true'
   if (( FIPS )); then
+    # shellcheck disable=SC2016  # single-quoted by design — the
+    # expression must travel verbatim across ssh and only expand on
+    # the guest, not on the orchestrator.
     ready_check='[ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ]'
   fi
   # Re-resolve IP each iteration; cloud-init reboot can yield a new DHCP lease.

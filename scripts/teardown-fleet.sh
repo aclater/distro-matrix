@@ -50,9 +50,11 @@ for vm in "${vms[@]}"; do
   else
     log "  not defined: $vm"
   fi
-  # Remove any leftover overlay/cidata artifacts
-  if [[ -d $WORK_DIR/$vm ]]; then
-    rm -rf "$WORK_DIR/$vm" || true
+  # Remove any leftover overlay/cidata artifacts.  The :? guard makes
+  # rm refuse to expand WORK_DIR/$vm to "/" if either side is somehow
+  # empty — defense in depth for shellcheck SC2115.
+  if [[ -n $vm && -d $WORK_DIR/$vm ]]; then
+    rm -rf "${WORK_DIR:?}/${vm:?}" || true
   fi
 done
 
