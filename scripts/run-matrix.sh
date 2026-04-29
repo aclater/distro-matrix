@@ -340,7 +340,9 @@ run_one() {
 log "concurrency: $PARALLEL"
 for i in "${!ALIASES[@]}"; do
   while (( $(jobs -p -r | wc -l) >= PARALLEL )); do
-    wait -n
+    # `wait -n` exits 127 if no children (race: job finished between the
+    # count check and the wait). Swallow that under set -e.
+    wait -n 2>/dev/null || true
   done
   run_one "$i" &
 done
