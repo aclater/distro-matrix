@@ -1,0 +1,23 @@
+# alias	family	expected_os_id	qcow2_relpath
+# alias is what Incus will name the imported image (prefixed with dm/) and the launched VM (prefixed with dm-).
+# expected_os_id is the value the matrix runner asserts against the scanner's parsed /etc/os-release ID field.
+# qcow2_relpath is relative to --image-root (default /mnt/pool0/media/iso/linux on TrueNAS, /mnt/media/iso/linux from harrison NFS).
+# Lines starting with # are ignored. Tabs separate fields.
+rhel-8	rhel	rhel	rhel/rhel-8.10-x86_64-kvm.qcow2
+rhel-9	rhel	rhel	rhel/rhel-9.7-x86_64-kvm.qcow2
+rhel-10	rhel	rhel	rhel/rhel-10.1-x86_64-kvm.qcow2
+rocky-8	rhel	rocky	rocky/Rocky-8-GenericCloud-LVM-8.10-20240528.0.x86_64.qcow2
+rocky-9	rhel	rocky	rocky/Rocky-9-GenericCloud-Base-9.7-20251123.2.x86_64.qcow2
+rocky-10	rhel	rocky	rocky/Rocky-10-GenericCloud-LVM-10.1-20251116.0.x86_64.qcow2
+alma-8	rhel	almalinux	almalinux/AlmaLinux-8-GenericCloud-8.10-20260414.x86_64.qcow2
+alma-9	rhel	almalinux	almalinux/AlmaLinux-9-GenericCloud-9.7-20260414.x86_64.qcow2
+alma-10	rhel	almalinux	almalinux/AlmaLinux-10-GenericCloud-10.1-20260414.0.x86_64.qcow2
+centos-stream-9	rhel	centos	centos/CentOS-Stream-GenericCloud-x86_64-9-20260427.0.x86_64.qcow2
+centos-stream-10	rhel	centos	centos/CentOS-Stream-GenericCloud-x86_64-10-20260427.0.x86_64.qcow2
+fedora-44	rhel	fedora	fedora/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
+ubuntu-24.04	debian	ubuntu	ubuntu/ubuntu-24.04-server-cloudimg-amd64.img
+ubuntu-25.10	debian	ubuntu	ubuntu/ubuntu-25.10-server-cloudimg-amd64.img
+# debian-12 hangs at boot — see https://github.com/aclater/distro-matrix/issues/3
+# debian-12	debian	debian	debian/debian-12-genericcloud-amd64.qcow2
+debian-13	debian	debian	debian/debian-13-genericcloud-amd64.qcow2
+# sles-15	suse	sles	sles/<populate after manual SCC download>
