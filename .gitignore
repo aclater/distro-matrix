@@ -1,0 +1,13 @@
+.env
+*.log
+*.tmp
+.cache/
+.venv/
+__pycache__/
+*.pyc
+
+# Local matrix runner state
+results/
+*.sarif
+*.xml
+cloud-init-*.iso
