@@ -43,6 +43,54 @@ test-on-distros --scanner ./pqc_readiness.py --scanner-args '--json' --only rhel
 
 See `~/.claude/CLAUDE.md` for the agent integration story (when to invoke, when not to, how to handle failures).
 
+## Keep-alive fleets — `spawn-fleet.sh`
+
+`run-matrix.sh` is one-shot: boot, scan, destroy. For workflows that want VMs to *stay alive* — driving them with Ansible, running multi-step playbooks, comparing per-host results across reboots — use `scripts/spawn-fleet/spawn-fleet.sh`. It reuses the same `virt-install` + `cloud-localds` primitives, but:
+
+- Reads a manifest of `alias COUNT` pairs (one line per distro, one VM per count) instead of the `--only` filter.
+- Does **not** run a scanner. Boot completes, IP is captured, the VM is left running.
+- Emits `inventory.ini` (Ansible INI format, grouped by distro family and alias) and `fleet.tsv` (vmname / alias / family / expected_id / ip).
+- Names VMs `dm-fleet-<alias>-NN` so multiple fleets coexist on one hypervisor.
+
+```bash
+cat > fleet.tsv <<'EOF'
+rhel-10    1
+rocky-10   1
+EOF
+
+scripts/spawn-fleet/spawn-fleet.sh \
+  --manifest ./fleet.tsv \
+  --memory 18432 \
+  --vcpus 2 \
+  --fips \
+  --results-dir ./fleet-fips/
+
+ansible -i ./fleet-fips/inventory.ini all -m ping
+```
+
+The inventory emitter is a small Python helper at `scripts/spawn-fleet/inventory.py`; the bash script invokes it after IP capture. Easier to extend to YAML inventory or richer host vars later than to grow the bash.
+
+When you're done, `scripts/teardown-fleet.sh --results-dir ./fleet-fips/` destroys + undefines every VM listed in `fleet.tsv`. Idempotent; VMs that no longer exist are silently skipped.
+
+### Three FIPS infrastructure fixes baked in
+
+The FIPS path on EL10 hit three landmines during the fleet test that motivated this script. All three are handled inline:
+
+1. **`fips-mode-setup` removed from EL10's `crypto-policies-scripts`.** When `--fips` is set and the binary is absent, cloud-init falls back to `update-crypto-policies --set FIPS` + `grubby --update-kernel=ALL --args="fips=1"` + `dracut -f --regenerate-all` + `:>/etc/system-fips`.
+2. **libvirtd `--timeout` killing VMs mid-cloud-init reboot.** Pre-flight in `spawn-fleet.sh` detects a `--timeout` flag in `libvirtd.service` and prints the no-timeout drop-in for the operator to install. Not auto-installed (no privilege model for that).
+3. **Separate `/boot` partition on LVM cloud images.** When `--fips` is set, the kernel cmdline gets `boot=UUID=$(findmnt -no UUID /boot)` if `/boot` is its own filesystem, so the dracut FIPS integrity check can find `/boot/.vmlinuz-*.hmac` pre-pivot.
+
+The libvirtd drop-in:
+
+```ini
+# /etc/systemd/system/libvirtd.service.d/no-timeout.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/libvirtd
+```
+
+`sudo systemctl daemon-reload && sudo systemctl restart libvirtd` after.
+
 ## How a VM is built
 
 ```
