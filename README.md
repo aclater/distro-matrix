@@ -174,6 +174,19 @@ Reserved slot — populate by hand (SCC registration required, can't be scripted
 2. Download the SLES 15 SP6 (or SP7) JeOS qcow2 to `<image-root>/sles/`
 3. Uncomment and adjust the `sles-15` line in `distros.tsv`
 
+## Regression tests
+
+### FIPS algorithm-fence divergence
+
+`.github/workflows/fips-divergence-regression.yml` boots a 2-VM fleet (one RHEL 10, one rebuild distro 10) under FIPS, runs `pqc_readiness.py --json` on each, and asserts the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
+
+- The RHEL host must report **zero PQC KEMs and zero PQC signature algorithms** while FIPS is active. If it does not, RHEL's downstream FIPS-provider gating patches have regressed.
+- The rebuild host must report **non-zero PQC KEMs or signatures** while FIPS is active. If it does not, the rebuild started carrying the gating patches; investigate before relaxing the test.
+
+The assertion script is `scripts/check-fips-divergence.py`. The classifier (which distro IDs ship the patches) is a single frozenset at the top of that script — adding to it is a claim about a build, not a marketing statement.
+
+The workflow runs weekly (Mondays 07:00 UTC) and on demand via `workflow_dispatch`. It does not run on every PR — libvirt + a self-hosted runner are the assumption. On failure, both VMs' `result.json` files are uploaded as workflow artifacts.
+
 ## Known issues
 
 - **debian-12** boots but never acquires a DHCPv4 lease — root cause TBD. Tracked in [#3](https://github.com/aclater/distro-matrix/issues/3). Currently commented out in `distros.tsv`.
