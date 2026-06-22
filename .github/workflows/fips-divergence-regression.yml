@@ -32,10 +32,10 @@ jobs:
 
     steps:
       - name: Checkout distro-matrix
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
 
       - name: Checkout pqc-readiness alongside
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           repository: aclater/pqc-readiness
           path: pqc-readiness
