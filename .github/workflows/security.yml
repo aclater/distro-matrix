@@ -15,7 +15,7 @@ jobs:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.1
 
       - name: Run Trivy filesystem scanner
         uses: aquasecurity/trivy-action@v0.36.0
@@ -40,7 +40,7 @@ jobs:
     name: CodeQL (GitHub Actions)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.1
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
