@@ -38,7 +38,7 @@ The runner stages a thin qcow2 overlay, builds a NoCloud cidata.iso with cloud-i
 `~/.local/bin/test-on-distros` (lives outside this repo, in your `$PATH`) is a thin SSH wrapper that pushes a local scanner to a remote host running this repo and prints the report back. Designed for the "before I open a PR, does my change still work on rhel-9 and debian-13?" workflow:
 
 ```
-test-on-distros --scanner ./pqc_readiness.py --scanner-args '--json' --only rhel-9,debian-13 --parallel 4
+test-on-distros --scanner ./dist/pqc-readiness.pyz --scanner-args '--json' --only rhel-9,debian-13 --parallel 4
 ```
 
 See `~/.claude/CLAUDE.md` for the agent integration story (when to invoke, when not to, how to handle failures).
@@ -178,7 +178,7 @@ Reserved slot — populate by hand (SCC registration required, can't be scripted
 
 ### FIPS algorithm-fence divergence
 
-`.github/workflows/fips-divergence-regression.yml` boots a 2-VM fleet (one RHEL 10, one rebuild distro 10) under FIPS, runs `pqc_readiness.py --json` on each, and asserts the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
+`.github/workflows/fips-divergence-regression.yml` boots a 2-VM fleet (one RHEL 10, one rebuild distro 10) under FIPS, runs the pqc-readiness zipapp (`pqc-readiness.pyz --json`) on each, and asserts the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
 
 - The RHEL host must report **zero PQC KEMs and zero PQC signature algorithms** while FIPS is active. If it does not, RHEL's downstream FIPS-provider gating patches have regressed.
 - The rebuild host must report **non-zero PQC KEMs or signatures** while FIPS is active. If it does not, the rebuild started carrying the gating patches; investigate before relaxing the test.
