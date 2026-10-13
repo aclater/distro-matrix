@@ -1,7 +1,7 @@
 name: FIPS algorithm-fence divergence regression
 
 # Boots a 2-VM fleet under FIPS — one RHEL 10, one rebuild distro 10 —
-# runs pqc_readiness.py --json on each, and asserts the divergence
+# runs the pqc-readiness zipapp (--json) on each, and asserts the divergence
 # documented in pqc-readiness/docs/findings/fips-algorithm-fence.md
 # still holds:
 #   - RHEL FIPS-on must report zero PQC KEMs and zero PQC signatures
@@ -40,6 +40,11 @@ jobs:
           repository: aclater/pqc-readiness
           path: pqc-readiness
 
+      - name: Build the pqc-readiness zipapp
+        # pqc-readiness#80 replaced the single-file pqc_readiness.py with a
+        # package; the deployable artifact is a stdlib-only zipapp.
+        run: python3 pqc-readiness/scripts/build_zipapp.py
+
       - name: Boot 2-VM FIPS fleet
         run: |
           cat > fleet.tsv <<'EOF'
@@ -53,15 +58,15 @@ jobs:
             --fips \
             --results-dir ./fleet-fips/
 
-      - name: Run pqc_readiness.py on every host
+      - name: Run pqc-readiness on every host
         run: |
           set -euo pipefail
           while IFS=$'\t' read -r vm alias family expected ip; do
             [[ -z $vm || $ip == FAIL ]] && continue
             scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                pqc-readiness/pqc_readiness.py "matrix@$ip:/tmp/"
+                pqc-readiness/dist/pqc-readiness.pyz "matrix@$ip:/tmp/"
             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                "matrix@$ip" "sudo python3 /tmp/pqc_readiness.py --json" \
+                "matrix@$ip" "sudo python3 /tmp/pqc-readiness.pyz --json" \
                 > "./fleet-fips/$vm/result.json"
           done < ./fleet-fips/fleet.tsv
 
