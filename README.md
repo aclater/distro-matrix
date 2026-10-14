@@ -185,14 +185,23 @@ Reserved slot — populate by hand (SCC registration required, can't be scripted
 
 ### FIPS algorithm-fence divergence
 
-`.github/workflows/fips-divergence-regression.yml` boots a 2-VM fleet (one RHEL 10, one rebuild distro 10) under FIPS, runs the pqc-readiness zipapp (`pqc-readiness.pyz --json`) on each, and asserts the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
+`scripts/fips-divergence.sh` boots a 2-VM fleet (`rhel10` and `rocky10`, 2 vCPU / 4 GiB each) with FIPS enabled through `spawn-fleet`, runs the pqc-readiness zipapp (`pqc-readiness.pyz --json`) on each, and asserts that the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
 
 - The RHEL host must report **zero PQC KEMs and zero PQC signature algorithms** while FIPS is active. If it does not, RHEL's downstream FIPS-provider gating patches have regressed.
 - The rebuild host must report **non-zero PQC KEMs or signatures** while FIPS is active. If it does not, the rebuild started carrying the gating patches; investigate before relaxing the test.
 
 The assertion script is `scripts/check-fips-divergence.py`. The classifier (which distro IDs ship the patches) is a single frozenset at the top of that script — adding to it is a claim about a build, not a marketing statement.
 
-The workflow targets a `[self-hosted, libvirt]` runner, and none is registered, so every scheduled run has been cancelled. #28 replaces it with a local, on-demand run.
+Run it on demand; it tears the fleet down on exit (`--keep` leaves it running):
+
+```bash
+scripts/fips-divergence.sh                          # builds the zipapp from ../pqc-readiness, or downloads the latest release
+scripts/fips-divergence.sh --pqc-readiness ./pqc-readiness.pyz --image-root /mnt/media/iso/linux
+```
+
+FIPS sshd rejects ed25519 keys, so each run generates a throwaway RSA key in its results directory. RHEL images need a Red Hat login and usually live only on the shared image store. Without one, the RHEL half is skipped with a message, and the script exits 3 so a partial run isn't mistaken for a pass. Exit codes: 0 divergence holds; 1 or 2 divergence broken (see the assertion script); 3 partial run; 4 setup or fleet failure.
+
+This used to be a scheduled workflow, but it needed a self-hosted libvirt runner that was never registered, so every run was cancelled (#28).
 
 ## Known issues
 
