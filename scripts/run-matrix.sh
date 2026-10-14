@@ -247,6 +247,9 @@ run_one() {
     if (( ! recorded )); then
       fail "aborted during: $step (exit $rc; see $out_dir/virt.log)"
     fi
+    # The guest's serial console is the only way to see why a VM never came
+    # up (#43); keep it with the results before the work dir goes.
+    [[ -s $work/console.log ]] && cp "$work/console.log" "$out_dir/console.log" 2>/dev/null
     if [[ $(cut -f6 "$out_dir/record.tsv" 2>/dev/null) == FAIL && $KEEP_ON_FAILURE -eq 1 ]]; then
       dm_keep "$vm"
       log "[$alias] keeping $vm + $work (debug)"
