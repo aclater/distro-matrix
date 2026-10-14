@@ -221,6 +221,80 @@ dm_libvirt_destroy() {
     || true
 }
 
+# --- qemu backend (through vm-run) -----------------------------------------
+# Plain qemu-system-x86_64 launched through ~/.local/bin/vm-run, which admits
+# each VM against the host's vCPU budget (and queues it until there's room)
+# and runs it in the capped pqc-vms.slice. User-mode networking with an SSH
+# port forward on 127.0.0.1: no libvirt, no root, and the base image can stay
+# under ~/.cache as an overlay backing file because qemu runs as us. (#21)
+#
+# State lives in the VM's work dir ($DM_WORK_DIR/<vm>): qemu.pid, ssh-port,
+# console.log.
+
+dm_qemu_available() {
+  command -v vm-run >/dev/null && command -v qemu-system-x86_64 >/dev/null && [[ -w /dev/kvm ]]
+}
+
+# vm-run's current budget in vCPUs ("vCPU in use: X / N"), or empty.
+# awk reads to the end: exiting early would SIGPIPE vm-run, and with
+# pipefail + set -e that kills the caller.
+dm_vmrun_budget() {
+  vm-run --status 2>/dev/null | awk '/vCPU in use:/ {b = $NF} END {print b}'
+}
+
+dm_qemu_pid() {
+  local f="$DM_WORK_DIR/$1/qemu.pid" pid
+  [[ -r $f ]] || return 1
+  pid=$(< "$f")
+  [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+dm_qemu_exists() { dm_qemu_pid "$1" >/dev/null; }
+
+# A free TCP port on 127.0.0.1 for the SSH forward.
+dm_free_port() {
+  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
+dm_qemu_create() {
+  local vm=$1 work=$2 vcpus=$3 mem=$4 port
+  if dm_qemu_exists "$vm"; then
+    dm_log "[$vm] refusing to reuse a running VM"
+    return 1
+  fi
+  port=$(dm_free_port)
+  echo "$port" > "$work/ssh-port"
+  # cidata as a virtio disk, as with libvirt: some cloud kernels (Debian 12)
+  # can't see a SATA CD-ROM (#3). vm-run blocks here until the VM fits the
+  # budget; the caller's boot timeout starts after this returns.
+  vm-run --name "$vm" qemu-system-x86_64 \
+    -name "$vm" \
+    -machine q35,accel=kvm -cpu host \
+    -smp "$vcpus" -m "$mem" \
+    -drive "file=$work/disk.qcow2,if=virtio,format=qcow2" \
+    -drive "file=$work/cidata.iso,if=virtio,format=raw,readonly=on" \
+    -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:22" \
+    -device virtio-net-pci,netdev=n0 \
+    -display none -serial "file:$work/console.log" \
+    -daemonize -pidfile "$work/qemu.pid"
+}
+
+dm_qemu_target() {
+  dm_qemu_exists "$1" && [[ -r $DM_WORK_DIR/$1/ssh-port ]] && echo "127.0.0.1 $(< "$DM_WORK_DIR/$1/ssh-port")"
+}
+
+dm_qemu_destroy() {
+  local vm=$1 pid _
+  [[ $vm == dm-"${DM_RUN_ID,,}"-* ]] || { dm_log "[$vm] not ours; not destroying"; return 1; }
+  pid=$(dm_qemu_pid "$vm") || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 # --- SSH -------------------------------------------------------------------
 
 dm_ssh() {

@@ -37,7 +37,14 @@
 #   --scanner-timeout SEC     Max seconds for the scanner itself (default: 300)
 #   --ssh-key PATH            SSH pubkey to inject (default: first of
 #                             ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)
-#   --parallel N              Run N distros in parallel (default: 1)
+#   --backend B               qemu (VMs launched through vm-run, inside the host's
+#                             vCPU budget), libvirt (virt-install on --connect), or
+#                             auto (default: qemu when vm-run, qemu-system-x86_64 and
+#                             /dev/kvm are available, else libvirt)
+#   --parallel N|auto         Distros in flight at once. auto (default): with qemu,
+#                             vm-run's budget / --vcpus (vm-run still queues anything
+#                             over budget); with libvirt, 1. libvirt VMs bypass
+#                             vm-run, so keep libvirt runs at 1-2.
 #   --no-backing              Copy qcow2 instead of using qemu-img backing-file overlay.
 #                             Done automatically when libvirt's qemu user can't read
 #                             the base image (e.g. it lives under ~/.cache).
@@ -72,7 +79,8 @@ DISK=10
 BOOT_TIMEOUT=240
 SCANNER_TIMEOUT=300
 SSH_KEY=$(dm_default_ssh_key || echo "$HOME/.ssh/id_ed25519.pub")
-PARALLEL=1
+PARALLEL=auto
+BACKEND=auto
 NO_BACKING=0
 KEEP_ON_FAILURE=0
 LIBVIRT_URI=qemu:///system
@@ -96,6 +104,7 @@ while [[ $# -gt 0 ]]; do
     --scanner-timeout) SCANNER_TIMEOUT=$2; shift 2 ;;
     --ssh-key) SSH_KEY=$2; shift 2 ;;
     --parallel) PARALLEL=$2; shift 2 ;;
+    --backend) BACKEND=$2; shift 2 ;;
     --no-backing) NO_BACKING=1; shift ;;
     --keep-on-failure) KEEP_ON_FAILURE=1; shift ;;
     --connect) LIBVIRT_URI=$2; shift 2 ;;
@@ -109,7 +118,25 @@ done
 [[ -r $DISTROS_FILE ]] || { echo "distros file not readable: $DISTROS_FILE" >&2; exit 2; }
 [[ -r $SSH_KEY ]] || { echo "ssh pubkey not readable: $SSH_KEY" >&2; exit 2; }
 [[ -d $IMAGE_ROOT ]] || echo "note: image-root $IMAGE_ROOT not present; using the local cache only" >&2
-for cmd in virsh virt-install cloud-localds qemu-img jq ssh scp; do
+case $BACKEND in
+  auto) if dm_qemu_available; then BACKEND=qemu; else BACKEND=libvirt; fi ;;
+  qemu) dm_qemu_available || { echo "qemu backend needs vm-run, qemu-system-x86_64 and a writable /dev/kvm" >&2; exit 2; } ;;
+  libvirt) ;;
+  *) echo "unknown --backend: $BACKEND (qemu|libvirt|auto)" >&2; exit 2 ;;
+esac
+need=(cloud-localds qemu-img jq ssh scp python3)
+[[ $BACKEND == libvirt ]] && need+=(virsh virt-install)
+if [[ $PARALLEL == auto ]]; then
+  if [[ $BACKEND == qemu ]]; then
+    budget=$(dm_vmrun_budget)
+    PARALLEL=$(( ${budget:-$VCPUS} / VCPUS ))
+    (( PARALLEL >= 1 )) || PARALLEL=1
+  else
+    PARALLEL=1
+  fi
+fi
+[[ $PARALLEL =~ ^[1-9][0-9]*$ ]] || { echo "--parallel must be a positive integer or auto" >&2; exit 2; }
+for cmd in "${need[@]}"; do
   command -v "$cmd" >/dev/null || { echo "missing required tool: $cmd" >&2; exit 2; }
 done
 
@@ -131,7 +158,6 @@ DM_WORK_DIR=$WORK_DIR
 DM_LIBVIRT_URI=$LIBVIRT_URI
 # shellcheck disable=SC2034
 DM_SSH_KEY=$SSH_KEY
-BACKEND=libvirt
 dm_init
 
 # --- Parse distros.tsv -----------------------------------------------------
@@ -284,7 +310,7 @@ run_one() {
 }
 
 # --- Drive the matrix (sequential or parallel) -----------------------------
-log "concurrency: $PARALLEL"
+log "backend: $BACKEND, concurrency: $PARALLEL"
 for i in "${!ALIASES[@]}"; do
   while (( $(jobs -p -r | wc -l) >= PARALLEL )); do
     # `wait -n` exits 127 if no children (race: job finished between the
@@ -322,6 +348,7 @@ done
   echo
   echo "- timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- scanner: \`$SCANNER\`"
+  echo "- backend: $BACKEND"
   echo "- concurrency: $PARALLEL"
   echo "- distros: ${#ALIASES[@]} (pass: $N_PASS, fail: $N_FAIL)"
   echo
