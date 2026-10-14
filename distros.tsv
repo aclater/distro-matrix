@@ -15,8 +15,7 @@ al2023	rhel	amzn	amazonlinux/al2023-kvm-2023.12.20261012.0-kernel-6.1-x86_64.xfs
 alma10	rhel	almalinux	almalinux/AlmaLinux-10-GenericCloud-10.2-20261012.0.x86_64.qcow2
 alma8	rhel	almalinux	almalinux/AlmaLinux-8-GenericCloud-8.10-20260928.x86_64.qcow2
 alma9	rhel	almalinux	almalinux/AlmaLinux-9-GenericCloud-9.8-20261005.x86_64.qcow2
-# disabled: hangs at boot under libvirt, see issue #3
-# debian12	debian	debian	debian/debian-12-genericcloud-amd64-20261006-2623.qcow2
+debian12	debian	debian	debian/debian-12-genericcloud-amd64-20261006-2623.qcow2
 debian13	debian	debian	debian/debian-13-genericcloud-amd64.qcow2
 fedora43	rhel	fedora	fedora/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
 fedora44	rhel	fedora	fedora/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
