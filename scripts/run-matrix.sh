@@ -23,21 +23,29 @@
 #
 # Optional:
 #   --distros PATH            distros.tsv (default: <repo>/distros.tsv)
-#   --image-root PATH         Where qcow2s live (default: /mnt/media/iso/linux)
+#   --image-root PATH         Where qcow2s live, tried after the local cache
+#                             (~/.cache/pqc-vm-matrix/images, by alias; override
+#                             with DM_IMAGE_CACHE). Default: /mnt/media/iso/linux
 #   --results-dir PATH        Where reports land (default: <repo>/results/<UTC ts>)
 #   --work-dir PATH           Per-VM disk + cidata staging (default: /tmp/distro-matrix-work)
-#   --only LIST               Comma-separated alias subset (e.g. debian-13,rhel-9)
+#   --only LIST               Comma-separated alias subset (e.g. debian13,rocky9)
 #   --skip LIST               Comma-separated aliases to skip
 #   --vcpus N                 vCPUs per VM (default: 1)
 #   --memory MIB              RAM per VM in MiB (default: 1536)
 #   --disk GIB                Resize qcow2 to this GiB before boot (default: 10)
 #   --boot-timeout SEC        Max seconds for IP + SSH (default: 240)
 #   --scanner-timeout SEC     Max seconds for the scanner itself (default: 300)
-#   --ssh-key PATH            SSH pubkey to inject (default: ~/.ssh/id_rsa.pub)
+#   --ssh-key PATH            SSH pubkey to inject (default: first of
+#                             ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)
 #   --parallel N              Run N distros in parallel (default: 1)
 #   --no-backing              Copy qcow2 instead of using qemu-img backing-file overlay.
-#                             Use this if --image-root isn't libvirt-readable.
+#                             Done automatically when libvirt's qemu user can't read
+#                             the base image (e.g. it lives under ~/.cache).
 #   --keep-on-failure         Leave the VM + workdir for the failed distro (debug)
+#
+# Every VM is named dm-<run-id>-<alias>; concurrent runs never collide, and a
+# run only ever destroys VMs it created. Interrupting a run (Ctrl-C, TERM) or
+# an error tears down everything it started.
 #   --connect URI             libvirt URI (default: qemu:///system)
 #   --help
 
@@ -45,6 +53,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+# Followed with `shellcheck -x`; plain runs (pre-commit) skip the sourced file.
+# shellcheck source=lib/vm.sh disable=SC1091
+source "$SCRIPT_DIR/lib/vm.sh"
 
 # Defaults
 DISTROS_FILE="$REPO_ROOT/distros.tsv"
@@ -60,7 +71,7 @@ MEMORY=1536
 DISK=10
 BOOT_TIMEOUT=240
 SCANNER_TIMEOUT=300
-SSH_KEY="$HOME/.ssh/id_rsa.pub"
+SSH_KEY=$(dm_default_ssh_key || echo "$HOME/.ssh/id_ed25519.pub")
 PARALLEL=1
 NO_BACKING=0
 KEEP_ON_FAILURE=0
@@ -97,7 +108,7 @@ done
 [[ -r $SCANNER ]] || { echo "scanner not readable: $SCANNER" >&2; exit 2; }
 [[ -r $DISTROS_FILE ]] || { echo "distros file not readable: $DISTROS_FILE" >&2; exit 2; }
 [[ -r $SSH_KEY ]] || { echo "ssh pubkey not readable: $SSH_KEY" >&2; exit 2; }
-[[ -d $IMAGE_ROOT ]] || { echo "image-root not a directory: $IMAGE_ROOT" >&2; exit 2; }
+[[ -d $IMAGE_ROOT ]] || echo "note: image-root $IMAGE_ROOT not present; using the local cache only" >&2
 for cmd in virsh virt-install cloud-localds qemu-img jq ssh scp; do
   command -v "$cmd" >/dev/null || { echo "missing required tool: $cmd" >&2; exit 2; }
 done
@@ -109,16 +120,22 @@ mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 
 REPORT="$RESULTS_DIR/report.md"
 SUMMARY_JSON="$RESULTS_DIR/summary.json"
-SSH_KEY_PRIV="${SSH_KEY%.pub}"
+log() { dm_log "$@"; }
 
-log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-          -o LogLevel=ERROR -o ConnectTimeout=10
-          -o BatchMode=yes -o GlobalKnownHostsFile=/dev/null)
+# Read by lib/vm.sh.
+# shellcheck disable=SC2034
+DM_RESULTS_DIR=$RESULTS_DIR
+# shellcheck disable=SC2034
+DM_WORK_DIR=$WORK_DIR
+# shellcheck disable=SC2034
+DM_LIBVIRT_URI=$LIBVIRT_URI
+# shellcheck disable=SC2034
+DM_SSH_KEY=$SSH_KEY
+BACKEND=libvirt
+dm_init
 
 # --- Parse distros.tsv -----------------------------------------------------
-declare -a ALIASES FAMILIES EXPECTED_OS QCOW_PATHS
+declare -a ALIASES FAMILIES EXPECTED_OS QCOW_RELPATHS
 while IFS=$'\t' read -r alias family expected_os qcow_relpath; do
   [[ $alias =~ ^# ]] && continue
   [[ -z $alias ]] && continue
@@ -127,7 +144,7 @@ while IFS=$'\t' read -r alias family expected_os qcow_relpath; do
   ALIASES+=("$alias")
   FAMILIES+=("$family")
   EXPECTED_OS+=("$expected_os")
-  QCOW_PATHS+=("$IMAGE_ROOT/$qcow_relpath")
+  QCOW_RELPATHS+=("$qcow_relpath")
 done < "$DISTROS_FILE"
 
 if [[ ${#ALIASES[@]} -eq 0 ]]; then
@@ -135,181 +152,111 @@ if [[ ${#ALIASES[@]} -eq 0 ]]; then
   exit 1
 fi
 
+log "run: $DM_RUN_ID"
 log "matrix: ${#ALIASES[@]} distro(s) — ${ALIASES[*]}"
 log "results dir: $RESULTS_DIR"
 log "work dir: $WORK_DIR"
 
-PUBKEY_CONTENT=$(< "$SSH_KEY")
-
-# --- Per-distro state ------------------------------------------------------
-# Parallel runs write their record to $RESULTS_DIR/<alias>/record.tsv so the
-# parent doesn't have to share an in-memory array (subshells can't write back).
-
-write_userdata() {
-  local hostname=$1 path=$2
-  cat > "$path" <<EOF
-#cloud-config
-hostname: $hostname
-manage_etc_hosts: true
-ssh_pwauth: false
-users:
-  - name: matrix
-    groups: [sudo, wheel]
-    sudo: 'ALL=(ALL) NOPASSWD:ALL'
-    shell: /bin/bash
-    lock_passwd: true
-    ssh_authorized_keys:
-      - $PUBKEY_CONTENT
-EOF
-}
-
-vm_ipv4() {
-  virsh -c "$LIBVIRT_URI" domifaddr "$1" 2>/dev/null \
-    | awk '/ipv4/ {split($4, a, "/"); print a[1]; exit}'
-}
-
-cleanup_vm() {
-  local vm=$1 work=$2 verdict=$3
-  if [[ $verdict == "FAIL" && $KEEP_ON_FAILURE -eq 1 ]]; then
-    log "[$vm] keeping VM + work dir (debug)"
-    return
-  fi
-  virsh -c "$LIBVIRT_URI" destroy "$vm" >/dev/null 2>&1 || true
-  virsh -c "$LIBVIRT_URI" undefine "$vm" --remove-all-storage --nvram >/dev/null 2>&1 \
-    || virsh -c "$LIBVIRT_URI" undefine "$vm" --remove-all-storage >/dev/null 2>&1 \
-    || true
-  rm -rf "$work"
-}
-
 record() {
   # alias \t expected \t detected \t exit \t duration \t verdict \t notes
+  # Empty fields are written as "-": the reader splits on tabs with
+  # `IFS=$'\t' read`, and tab is IFS whitespace, so an empty field would
+  # collapse and shift every column after it.
   local out_dir="$RESULTS_DIR/$1"
   mkdir -p "$out_dir"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${1:--}" "${2:--}" "${3:--}" "${4:--}" "${5:--}" "${6:--}" "${7:--}" \
     > "$out_dir/record.tsv"
 }
 
+# run_one runs in its own subshell. Any failing step lands in the EXIT trap,
+# which records FAIL with the step name and tears down this distro's VM; the
+# parent's trap only has to mop up after signals.
 run_one() {
-  local idx=$1
-  local alias=${ALIASES[$idx]}
-  local family=${FAMILIES[$idx]}
-  local expected=${EXPECTED_OS[$idx]}
-  local qcow=${QCOW_PATHS[$idx]}
-  local vm="dm-$alias"
-  local work="$WORK_DIR/$alias"
-  local out_dir="$RESULTS_DIR/$alias"
-  local notes=""
-  local detected_id=""
-  local exit_code="?"
-  local verdict="FAIL"
-  local started=$SECONDS
-
+  # Not `local`: the EXIT trap below runs after this function returns, and
+  # each run_one already has its own subshell.
+  idx=$1
+  alias=${ALIASES[$idx]}
+  expected=${EXPECTED_OS[$idx]}
+  started=$SECONDS step="start" recorded=0
+  vm=$(dm_vm_name "$alias")
+  work="$WORK_DIR/$vm"
+  out_dir="$RESULTS_DIR/$alias"
   mkdir -p "$out_dir" "$work"
-  log "[$alias] start"
 
-  if [[ ! -r $qcow ]]; then
-    notes="qcow2 missing: $qcow"
-    log "[$alias] $notes"
-    record "$alias" "$expected" "" "?" "0" "FAIL" "$notes"
-    return
-  fi
-
-  # Make sure no leftover VM by this name
-  virsh -c "$LIBVIRT_URI" destroy "$vm" >/dev/null 2>&1 || true
-  virsh -c "$LIBVIRT_URI" undefine "$vm" --remove-all-storage >/dev/null 2>&1 || true
-
-  # Stage disk + cidata.iso. By default, create a thin qcow2 overlay backed
-  # by the upstream qcow2 — qemu reads the base over NFS, writes to the
-  # local overlay (typically tens of MB). --no-backing falls back to a full
-  # copy for setups where qemu can't reach the image-root.
-  if (( NO_BACKING )); then
-    log "[$alias] copying qcow2 ($(du -h "$qcow" | cut -f1))"
-    cp "$qcow" "$work/disk.qcow2"
-    qemu-img resize "$work/disk.qcow2" "${DISK}G" >>"$out_dir/virt.log" 2>&1
-  else
-    log "[$alias] backing-file overlay over $qcow"
-    qemu-img create -f qcow2 -F qcow2 -b "$qcow" "$work/disk.qcow2" "${DISK}G" \
-      >>"$out_dir/virt.log" 2>&1
-  fi
-  write_userdata "$vm" "$work/user-data"
-  printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$vm" "$(date -u +%s)" "$vm" > "$work/meta-data"
-  cloud-localds "$work/cidata.iso" "$work/user-data" "$work/meta-data" \
-    >>"$out_dir/virt.log" 2>&1
-
-  # Boot
-  log "[$alias] virt-install"
-  # cidata as a virtio disk, not a CD-ROM: on q35 a CD-ROM sits on the AHCI
-  # SATA controller, and some cloud kernels (Debian 12's linux-image-cloud)
-  # have no AHCI driver, so cloud-init never sees the seed (#3).
-  if ! virt-install \
-        --connect "$LIBVIRT_URI" \
-        --name "$vm" \
-        --memory "$MEMORY" \
-        --vcpus "$VCPUS" \
-        --disk "path=$work/disk.qcow2,format=qcow2" \
-        --disk "path=$work/cidata.iso,device=disk,bus=virtio,format=raw,readonly=on" \
-        --import \
-        --os-variant detect=on,name=linux2024 \
-        --network network=default \
-        --graphics none \
-        --noautoconsole \
-        >>"$out_dir/virt.log" 2>&1; then
-    notes="virt-install failed (see $out_dir/virt.log)"
-    cleanup_vm "$vm" "$work" "FAIL"
-    record "$alias" "$expected" "" "?" "$((SECONDS - started))" "FAIL" "$notes"
-    return
-  fi
-
-  # Wait for IPv4 from libvirt's default network DHCP
-  local deadline=$(( SECONDS + BOOT_TIMEOUT ))
-  local ip=""
-  while (( SECONDS < deadline )); do
-    ip=$(vm_ipv4 "$vm")
-    [[ -n $ip ]] && break
-    sleep 5
-  done
-  if [[ -z $ip ]]; then
-    notes="no IPv4 within ${BOOT_TIMEOUT}s"
-    cleanup_vm "$vm" "$work" "FAIL"
-    record "$alias" "$expected" "" "?" "$((SECONDS - started))" "FAIL" "$notes"
-    return
-  fi
-  log "[$alias] ip=$ip"
-
-  # Wait for SSH (cloud-init may still be applying user keys)
-  local ssh_ready=0
-  while (( SECONDS < deadline )); do
-    if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "matrix@$ip" true >/dev/null 2>&1; then
-      ssh_ready=1
-      break
+  fail() {
+    record "$alias" "$expected" "" "?" "$((SECONDS - started))" "FAIL" "$1"
+    recorded=1
+  }
+  # shellcheck disable=SC2329  # invoked by the EXIT trap below
+  on_exit() {
+    local rc=$?
+    if (( ! recorded )); then
+      fail "aborted during: $step (exit $rc; see $out_dir/virt.log)"
     fi
-    sleep 5
-  done
-  if (( ! ssh_ready )); then
-    notes="SSH never ready within ${BOOT_TIMEOUT}s"
-    cleanup_vm "$vm" "$work" "FAIL"
-    record "$alias" "$expected" "" "?" "$((SECONDS - started))" "FAIL" "$notes"
+    if [[ $(cut -f6 "$out_dir/record.tsv" 2>/dev/null) == FAIL && $KEEP_ON_FAILURE -eq 1 ]]; then
+      dm_keep "$vm"
+      log "[$alias] keeping $vm + $work (debug)"
+    elif "dm_${BACKEND}_exists" "$vm" || [[ -d $work ]]; then
+      dm_destroy_vm "$BACKEND" "$vm" "$work"
+    fi
+  }
+  trap on_exit EXIT
+  trap 'exit 143' TERM
+
+  log "[$alias] start ($vm)"
+  local qcow
+  step="resolve image"
+  if ! qcow=$(dm_resolve_image "$alias" "${QCOW_RELPATHS[$idx]}" "$IMAGE_ROOT"); then
+    fail "image not found: $alias (cache $DM_IMAGE_CACHE/images, root $IMAGE_ROOT/${QCOW_RELPATHS[$idx]})"
+    return
+  fi
+  log "[$alias] image $qcow"
+
+  local copy=$NO_BACKING
+  if (( ! copy )) && [[ $BACKEND == libvirt ]] && ! dm_world_readable "$qcow"; then
+    log "[$alias] base image isn't readable by libvirt's qemu user; copying instead of overlaying"
+    copy=1
+  fi
+  step="stage disk"
+  dm_register "$BACKEND" "$vm" "$work"
+  dm_stage_disk "$qcow" "$work" "$DISK" "$copy" >>"$out_dir/virt.log" 2>&1
+  step="build cloud-init seed"
+  dm_write_seed "$work" "$(dm_hostname "$alias")" "$SSH_KEY" >>"$out_dir/virt.log" 2>&1
+
+  step="boot"
+  log "[$alias] boot ($BACKEND)"
+  if ! "dm_${BACKEND}_create" "$vm" "$work" "$VCPUS" "$MEMORY" >>"$out_dir/virt.log" 2>&1; then
+    fail "VM create failed (see $out_dir/virt.log)"
     return
   fi
 
-  # Push scanner and run as root
+  step="wait for SSH"
+  local target host port
+  if ! target=$(dm_wait_ssh "$BACKEND" "$vm" $(( SECONDS + BOOT_TIMEOUT ))); then
+    fail "no SSH within ${BOOT_TIMEOUT}s"
+    return
+  fi
+  read -r host port <<< "$target"
+  log "[$alias] ssh $host:$port"
+
+  step="run scanner"
   log "[$alias] pushing scanner + running"
-  scp "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$SCANNER" "matrix@$ip:/tmp/scanner" \
-    >>"$out_dir/virt.log" 2>&1
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "matrix@$ip" "
+  dm_scp_to "$host" "$port" "$SCANNER" /tmp/scanner >>"$out_dir/virt.log" 2>&1
+  dm_ssh "$host" "$port" "
     sudo install -m 0755 /tmp/scanner /usr/local/bin/scanner
     timeout ${SCANNER_TIMEOUT}s sudo /usr/local/bin/scanner $SCANNER_ARGS > /tmp/result.json 2> /tmp/stderr.log
     echo \$? > /tmp/exit-code
     sudo cp /etc/os-release /tmp/os-release
-    sudo chown matrix:matrix /tmp/result.json /tmp/stderr.log /tmp/exit-code /tmp/os-release
+    sudo chown matrix: /tmp/result.json /tmp/stderr.log /tmp/exit-code /tmp/os-release
   " 2>>"$out_dir/virt.log" || true
 
-  # Pull artifacts
+  step="collect results"
+  local f
   for f in result.json stderr.log exit-code os-release; do
-    scp "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "matrix@$ip:/tmp/$f" "$out_dir/$f" \
-      >>"$out_dir/virt.log" 2>&1 || true
+    dm_scp_from "$host" "$port" "/tmp/$f" "$out_dir/$f" >>"$out_dir/virt.log" 2>&1 || true
   done
 
+  local exit_code detected_id="" verdict=FAIL notes=""
   exit_code=$(tr -d '[:space:]' < "$out_dir/exit-code" 2>/dev/null || echo "?")
   if [[ -r $out_dir/os-release ]]; then
     detected_id=$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2}' "$out_dir/os-release")
@@ -325,18 +272,15 @@ run_one() {
   if (( ran_cleanly )) && [[ -s $out_dir/result.json ]] && [[ $detected_id == "$expected" ]]; then
     verdict=PASS
   elif (( ran_cleanly )) && [[ $detected_id != "$expected" ]]; then
-    verdict=FAIL
     notes="os-id mismatch: expected=$expected detected=${detected_id:-<unread>}"
-  elif (( ran_cleanly )) && [[ ! -s $out_dir/result.json ]]; then
-    verdict=FAIL
+  elif (( ran_cleanly )); then
     notes="scanner exited cleanly but produced empty stdout"
   else
-    verdict=FAIL
     notes="scanner did not run cleanly (exit=$exit_code)"
   fi
 
-  cleanup_vm "$vm" "$work" "$verdict"
   record "$alias" "$expected" "$detected_id" "$exit_code" "$((SECONDS - started))" "$verdict" "$notes"
+  recorded=1
 }
 
 # --- Drive the matrix (sequential or parallel) -----------------------------
@@ -347,7 +291,7 @@ for i in "${!ALIASES[@]}"; do
     # count check and the wait). Swallow that under set -e.
     wait -n 2>/dev/null || true
   done
-  run_one "$i" &
+  ( run_one "$i" ) &
 done
 wait
 
@@ -363,6 +307,9 @@ for alias in "${ALIASES[@]}"; do
     continue
   fi
   IFS=$'\t' read -r r_alias r_exp r_det r_exit r_dur r_verd r_notes < "$rec"
+  [[ $r_det == - ]] && r_det=""
+  [[ $r_notes == - ]] && r_notes=""
+  [[ $r_dur =~ ^[0-9]+$ ]] || r_dur=0
   ROW_ALIAS+=("$r_alias"); ROW_EXPECTED+=("$r_exp"); ROW_DETECTED+=("$r_det")
   ROW_EXIT+=("$r_exit"); ROW_DURATION+=("$r_dur"); ROW_VERDICT+=("$r_verd")
   ROW_NOTES+=("$r_notes")
