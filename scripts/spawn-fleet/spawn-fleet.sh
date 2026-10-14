@@ -226,13 +226,16 @@ boot_one() {
   # shellcheck disable=SC2024  # unprivileged user owns virt.log; the
   # sudo'd subprocess inherits the FD opened by the parent shell, so
   # the redirect lands in the right file with the right ownership.
+  # cidata as a virtio disk, not a CD-ROM: on q35 a CD-ROM sits on the AHCI
+  # SATA controller, and some cloud kernels (Debian 12's linux-image-cloud)
+  # have no AHCI driver, so cloud-init never sees the seed (#3).
   if ! sudo virt-install \
         --connect "$LIBVIRT_URI" \
         --name "$vm" \
         --memory "$MEMORY" \
         --vcpus "$VCPUS" \
         --disk "path=$work/disk.qcow2,format=qcow2" \
-        --disk "path=$work/cidata.iso,device=cdrom" \
+        --disk "path=$work/cidata.iso,device=disk,bus=virtio,format=raw,readonly=on" \
         --import \
         --os-variant detect=on,name=linux2024 \
         --network network=default \
