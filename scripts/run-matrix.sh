@@ -53,7 +53,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-# shellcheck source=lib/vm.sh
+# Followed with `shellcheck -x`; plain runs (pre-commit) skip the sourced file.
+# shellcheck source=lib/vm.sh disable=SC1091
 source "$SCRIPT_DIR/lib/vm.sh"
 
 # Defaults
