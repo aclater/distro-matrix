@@ -1,0 +1,13 @@
+# name	command (run as root on the guest; output saved to <alias>/ground-truth/<name>.txt)
+# Lines starting with # are ignored. A command that fails just records its output and exit code.
+os-release	cat /etc/os-release
+openssl-version	openssl version -a
+openssl-kems	openssl list -kem-algorithms
+openssl-tls-groups	openssl list -tls-groups
+ssh-version	ssh -V 2>&1
+ssh-kex	ssh -Q kex
+sshd-effective	sshd -T 2>/dev/null | grep -Ei "^(kexalgorithms|hostkeyalgorithms|ciphers|macs) "
+crypto-policy	update-crypto-policies --show
+fips	cat /proc/sys/crypto/fips_enabled
+packages-rpm	rpm -qa --qf "%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n" | sort
+packages-dpkg	dpkg-query -W -f "\${Package}\t\${Version}\n" | sort

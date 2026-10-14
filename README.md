@@ -51,6 +51,12 @@ test-on-distros --scanner ./dist/pqc-readiness.pyz --scanner-args '--json' --onl
 - **The SSH key** defaults to the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub` and `id_rsa.pub`.
 - **Every VM is named `dm-<run-id>-<alias>`.** Concurrent runs never collide, and a run only ever destroys VMs it created. Ctrl-C, TERM or an error tears down everything the run started, and each unfinished distro is recorded as FAIL with the step it was in.
 
+### Validating output and comparing builds
+
+- **`--schema schemas/pqc-readiness-report.schema.json`** validates each `result.json`; a violation fails that distro and the errors land in `<alias>/schema-A.txt`. The bundled schema is structural: it checks the fields the matrix and its consumers rely on, since pqc-readiness doesn't publish a report schema. It uses `python3-jsonschema` when importable (set `DM_PYTHON` to choose the interpreter), else a small built-in validator for the subset the schema uses.
+- **`--compare-scanner PATH`** runs a second scanner build on the same booted VM and writes `<alias>/compare.json`, a JSON diff that ignores timestamps and benchmark numbers. The difference count goes in the report's Notes; it doesn't change the verdict. This is the before/after check for a scanner change.
+- **`--ground-truth ground-truth/pqc-readiness.tsv`** runs each `name<TAB>command` line as root on the guest after the scan and saves `<alias>/ground-truth/<name>.txt`: `ssh -Q kex`, `sshd -T`, `openssl list`, the crypto policy, rpm/dpkg package lists. That's what the scanner's output should agree with.
+
 ## Keep-alive fleets — `spawn-fleet.sh`
 
 `run-matrix.sh` is one-shot: boot, scan, destroy. For workflows that want VMs to *stay alive* (driving them with Ansible, running multi-step playbooks, comparing per-host results across reboots), use `scripts/spawn-fleet/spawn-fleet.sh`. It's built on the same `scripts/lib/vm.sh` as the runner, so VMs carry a run ID, images come from the local cache before `--image-root`, and no `sudo` is needed (be in the `libvirt` group). Unlike the runner, it:
