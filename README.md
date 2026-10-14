@@ -43,15 +43,13 @@ test-on-distros --scanner ./dist/pqc-readiness.pyz --scanner-args '--json' --onl
 
 `test-on-distros` isn't part of this repo, and isn't installed on every host.
 
-### Running on a laptop (current limitations)
+### Backends, images and the host's VM budget
 
-The defaults assume the shared image store and an RSA key. Until #22 and #21 land, on a laptop pass:
-
-- `--image-root` pointing at a directory laid out like `distros.tsv`'s paths (the local cache in `~/.cache/pqc-vm-matrix/images` uses `<alias>.qcow2` names, so a directory of symlinks works);
-- `--ssh-key ~/.ssh/id_ed25519.pub` if you have no `id_rsa.pub`;
-- `--no-backing` if the images sit somewhere libvirt's qemu user can't read (such as `~/.cache`, mode 700).
-
-VMs started by this runner run under libvirt, outside any per-user CPU budget, so keep `--parallel` low on a shared workstation (#21).
+- **`--backend qemu`** (the default when `~/.local/bin/vm-run`, `qemu-system-x86_64` and `/dev/kvm` are available) launches each VM through `vm-run`. Every VM is admitted against the host's vCPU budget and queued until it fits, and it runs in the capped `pqc-vms.slice`. Networking is user-mode with an SSH forward on `127.0.0.1`, so there's no libvirt and no root. `--parallel auto` (the default) is the budget divided by `--vcpus`.
+- **`--backend libvirt`** uses `virt-install` on `--connect` (default `qemu:///system`) and the default network, as before. These VMs bypass `vm-run`, so `--parallel auto` means 1; keep it at 1-2 on a shared workstation.
+- **Images** resolve from the local cache first (`~/.cache/pqc-vm-matrix/images/<alias>.qcow2`, override with `DM_IMAGE_CACHE`), then from `--image-root`, which is optional. With libvirt, a base image its qemu user can't read (such as anything under `~/.cache`) is copied instead of overlaid automatically.
+- **The SSH key** defaults to the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub` and `id_rsa.pub`.
+- **Every VM is named `dm-<run-id>-<alias>`.** Concurrent runs never collide, and a run only ever destroys VMs it created. Ctrl-C, TERM or an error tears down everything the run started, and each unfinished distro is recorded as FAIL with the step it was in.
 
 ## Keep-alive fleets — `spawn-fleet.sh`
 
