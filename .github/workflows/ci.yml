@@ -27,3 +27,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: pre-commit/action@v3.0.1
+        env:
+          # no-commit-to-branch guards local commits; on a push to main
+          # it would always fail (#25).
+          SKIP: no-commit-to-branch
