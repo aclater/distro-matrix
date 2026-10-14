@@ -1,0 +1,256 @@
+# shellcheck shell=bash
+# distro-matrix VM lifecycle library, sourced by run-matrix.sh (and, later,
+# spawn-fleet.sh). It owns everything about a VM's life so the drivers only
+# decide *what* to run:
+#
+#   - run IDs: every VM name carries the run ID (dm-<run>-<alias>), so
+#     concurrent runs never collide and a run never touches a VM it didn't
+#     create (#19);
+#   - a cleanup registry plus traps: every VM and work dir a run creates is
+#     recorded, and the parent tears all of them down on exit, error or
+#     signal (#20);
+#   - image resolution: the local cache (~/.cache/pqc-vm-matrix) by alias,
+#     then --image-root (#22);
+#   - backends: libvirt (virt-install + cloud-localds); a vm-run backend is
+#     added in #21.
+#
+# Callers set DM_RESULTS_DIR, DM_WORK_DIR, DM_LIBVIRT_URI and DM_SSH_KEY
+# (public key path) before calling dm_init.
+
+DM_IMAGE_CACHE=${DM_IMAGE_CACHE:-$HOME/.cache/pqc-vm-matrix}
+DM_LIBVIRT_URI=${DM_LIBVIRT_URI:-qemu:///system}
+DM_SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+             -o LogLevel=ERROR -o ConnectTimeout=10
+             -o BatchMode=yes -o GlobalKnownHostsFile=/dev/null)
+
+dm_log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# First existing default public key, preferring ed25519 (FIPS hosts that
+# reject ed25519 need --ssh-key with an RSA key).
+dm_default_ssh_key() {
+  local k
+  for k in id_ed25519 id_ecdsa id_rsa; do
+    [[ -r $HOME/.ssh/$k.pub ]] && { echo "$HOME/.ssh/$k.pub"; return 0; }
+  done
+  return 1
+}
+
+# --- Run IDs and the cleanup registry --------------------------------------
+
+dm_new_run_id() {
+  printf '%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+# dm_init: pick a run ID, create the registry and install the traps. The
+# EXIT trap runs only in the parent: bash resets traps in async subshells.
+dm_init() {
+  DM_RUN_ID=${DM_RUN_ID:-$(dm_new_run_id)}
+  DM_REGISTRY="$DM_RESULTS_DIR/vms.tsv"
+  mkdir -p "$DM_RESULTS_DIR" "$DM_WORK_DIR"
+  : >> "$DM_REGISTRY"
+  echo "$DM_RUN_ID" > "$DM_RESULTS_DIR/run-id"
+  trap dm_cleanup_all EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+# VM names: dm-<run>-<alias>, lowercase, [a-z0-9-] only.
+dm_vm_name() {
+  local a=${1//[^A-Za-z0-9-]/-}
+  printf 'dm-%s-%s' "${DM_RUN_ID,,}" "${a,,}"
+}
+
+# Guest hostname: no run ID (it would push past 63 chars), no dots.
+dm_hostname() { local a=${1//[^A-Za-z0-9-]/-}; printf 'dm-%s' "${a,,}"; }
+
+# Registry rows: backend \t vm \t workdir. Appends are single small writes,
+# so concurrent run_one subshells can't interleave a row.
+dm_register() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$DM_REGISTRY"; }
+
+dm_destroy_vm() {
+  local backend=$1 vm=$2 work=$3
+  "dm_${backend}_destroy" "$vm" || true
+  if [[ -n $work && -d $work ]]; then
+    rm -rf "${work:?}"
+  fi
+}
+
+# Tear down everything this run registered. Children first: async jobs in
+# a non-interactive shell ignore SIGINT, so they would otherwise keep
+# booting VMs after the parent is gone.
+dm_cleanup_all() {
+  local rc=$?
+  trap - EXIT INT TERM
+  local pids
+  pids=$(jobs -p)
+  if [[ -n $pids ]]; then
+    # shellcheck disable=SC2086  # word-split the PID list on purpose
+    kill -TERM $pids 2>/dev/null || true
+    wait 2>/dev/null || true
+  fi
+  if [[ -s ${DM_REGISTRY:-} ]]; then
+    local backend vm work
+    while IFS=$'\t' read -r backend vm work; do
+      [[ -z $vm ]] && continue
+      [[ -e $DM_RESULTS_DIR/keep/$vm ]] && { dm_log "[$vm] kept for debugging"; continue; }
+      if "dm_${backend}_exists" "$vm"; then
+        dm_log "[$vm] cleanup"
+        dm_destroy_vm "$backend" "$vm" "$work"
+      elif [[ -n $work && -d $work ]]; then
+        rm -rf "${work:?}"
+      fi
+    done < "$DM_REGISTRY"
+  fi
+  exit "$rc"
+}
+
+# Mark a VM so dm_cleanup_all leaves it running (--keep-on-failure).
+dm_keep() { mkdir -p "$DM_RESULTS_DIR/keep"; : > "$DM_RESULTS_DIR/keep/$1"; }
+
+# --- Images ----------------------------------------------------------------
+
+# dm_resolve_image ALIAS RELPATH IMAGE_ROOT -> path on stdout.
+# Order: cache/images/<alias>.qcow2, the alias without '-'/'.' (rocky-9 ->
+# rocky9, the cache's naming), the cache alias whose manifest filename
+# matches RELPATH's basename, then IMAGE_ROOT/RELPATH.
+dm_resolve_image() {
+  local alias=$1 relpath=$2 root=$3 c="$DM_IMAGE_CACHE/images" m
+  local stripped=${alias//[-.]/}
+  for m in "$c/$alias.qcow2" "$c/$stripped.qcow2"; do
+    [[ -r $m ]] && { echo "$m"; return 0; }
+  done
+  if [[ -r $DM_IMAGE_CACHE/manifest.tsv ]]; then
+    m=$(awk -F'\t' -v f="${relpath##*/}" '!/^#/ && $3==f {print $1; exit}' "$DM_IMAGE_CACHE/manifest.tsv")
+    [[ -n $m && -r $c/$m.qcow2 ]] && { echo "$c/$m.qcow2"; return 0; }
+  fi
+  [[ -n $root && -r $root/$relpath ]] && { echo "$root/$relpath"; return 0; }
+  return 1
+}
+
+# Can a user outside our uid and groups (libvirt's qemu user) read PATH?
+# Needs o+x on every directory and o+r on the file, after resolving links.
+dm_world_readable() {
+  local p d
+  p=$(readlink -f "$1") || return 1
+  [[ $(stat -c %A "$p") == ???????r?? ]] || return 1
+  d=$(dirname "$p")
+  while [[ $d != / ]]; do
+    [[ $(stat -c %A "$d") == ?????????[xt] ]] || return 1
+    d=$(dirname "$d")
+  done
+}
+
+# --- Guest seed --------------------------------------------------------------
+
+# dm_write_seed WORK HOSTNAME PUBKEY_PATH [EXTRA_USERDATA_FILE]
+dm_write_seed() {
+  local work=$1 host=$2 pub extra=${4:-}
+  pub=$(< "$3")
+  cat > "$work/user-data" <<EOF
+#cloud-config
+hostname: $host
+manage_etc_hosts: true
+ssh_pwauth: false
+users:
+  - name: matrix
+    groups: [sudo, wheel]
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - $pub
+EOF
+  [[ -n $extra && -r $extra ]] && cat "$extra" >> "$work/user-data"
+  printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$host" "$(date -u +%s%N)" "$host" > "$work/meta-data"
+  cloud-localds "$work/cidata.iso" "$work/user-data" "$work/meta-data"
+}
+
+# dm_stage_disk BASE WORK DISK_GIB COPY(0|1) -> creates WORK/disk.qcow2
+dm_stage_disk() {
+  local base=$1 work=$2 gib=$3 copy=$4
+  if (( copy )); then
+    cp --reflink=auto "$(readlink -f "$base")" "$work/disk.qcow2"
+    qemu-img resize -q "$work/disk.qcow2" "${gib}G"
+  else
+    qemu-img create -q -f qcow2 -F qcow2 -b "$(readlink -f "$base")" "$work/disk.qcow2" "${gib}G"
+  fi
+}
+
+# --- libvirt backend -------------------------------------------------------
+# The VM's description carries the run ID, so `virsh list` shows whose it is.
+
+dm_libvirt_exists() { virsh -c "$DM_LIBVIRT_URI" dominfo "$1" >/dev/null 2>&1; }
+
+dm_libvirt_create() {
+  local vm=$1 work=$2 vcpus=$3 mem=$4
+  if dm_libvirt_exists "$vm"; then
+    dm_log "[$vm] refusing to reuse an existing domain"
+    return 1
+  fi
+  # cidata as a virtio disk, not a CD-ROM: on q35 a CD-ROM sits on the AHCI
+  # SATA controller, and some cloud kernels (Debian 12's linux-image-cloud)
+  # have no AHCI driver, so cloud-init never sees the seed (#3).
+  virt-install \
+    --connect "$DM_LIBVIRT_URI" \
+    --name "$vm" \
+    --metadata "description=distro-matrix run $DM_RUN_ID" \
+    --memory "$mem" \
+    --vcpus "$vcpus" \
+    --disk "path=$work/disk.qcow2,format=qcow2" \
+    --disk "path=$work/cidata.iso,device=disk,bus=virtio,format=raw,readonly=on" \
+    --import \
+    --os-variant detect=on,name=linux2024 \
+    --network network=default \
+    --graphics none \
+    --noautoconsole
+}
+
+# Prints "HOST PORT" once the guest has an address, else nothing.
+dm_libvirt_target() {
+  virsh -c "$DM_LIBVIRT_URI" domifaddr "$1" 2>/dev/null \
+    | awk '/ipv4/ {split($4, a, "/"); print a[1], 22; exit}'
+}
+
+dm_libvirt_destroy() {
+  local vm=$1
+  # Only ever a domain this run created: the caller passes a dm-<run>- name.
+  [[ $vm == dm-"${DM_RUN_ID,,}"-* ]] || { dm_log "[$vm] not ours; not destroying"; return 1; }
+  virsh -c "$DM_LIBVIRT_URI" destroy "$vm" >/dev/null 2>&1 || true
+  virsh -c "$DM_LIBVIRT_URI" undefine "$vm" --remove-all-storage --nvram >/dev/null 2>&1 \
+    || virsh -c "$DM_LIBVIRT_URI" undefine "$vm" --remove-all-storage >/dev/null 2>&1 \
+    || true
+}
+
+# --- SSH -------------------------------------------------------------------
+
+dm_ssh() {
+  local host=$1 port=$2; shift 2
+  ssh "${DM_SSH_OPTS[@]}" -p "$port" -i "${DM_SSH_KEY%.pub}" "matrix@$host" "$@"
+}
+
+dm_scp_to() {
+  local host=$1 port=$2 src=$3 dst=$4
+  scp "${DM_SSH_OPTS[@]}" -P "$port" -i "${DM_SSH_KEY%.pub}" "$src" "matrix@$host:$dst"
+}
+
+dm_scp_from() {
+  local host=$1 port=$2 src=$3 dst=$4
+  scp "${DM_SSH_OPTS[@]}" -P "$port" -i "${DM_SSH_KEY%.pub}" "matrix@$host:$src" "$dst"
+}
+
+# dm_wait_ssh BACKEND VM DEADLINE_SECONDS -> prints "HOST PORT" when ready.
+dm_wait_ssh() {
+  local backend=$1 vm=$2 deadline=$3 target host port
+  while (( SECONDS < deadline )); do
+    target=$("dm_${backend}_target" "$vm")
+    if [[ -n $target ]]; then
+      read -r host port <<< "$target"
+      if dm_ssh "$host" "$port" true >/dev/null 2>&1; then
+        echo "$host $port"
+        return 0
+      fi
+    fi
+    sleep 5
+  done
+  return 1
+}
