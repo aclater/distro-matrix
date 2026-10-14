@@ -53,39 +53,30 @@ test-on-distros --scanner ./dist/pqc-readiness.pyz --scanner-args '--json' --onl
 
 ## Keep-alive fleets — `spawn-fleet.sh`
 
-`run-matrix.sh` is one-shot: boot, scan, destroy. For workflows that want VMs to *stay alive* — driving them with Ansible, running multi-step playbooks, comparing per-host results across reboots — use `scripts/spawn-fleet/spawn-fleet.sh`. It reuses the same `virt-install` + `cloud-localds` primitives, but:
+`run-matrix.sh` is one-shot: boot, scan, destroy. For workflows that want VMs to *stay alive* (driving them with Ansible, running multi-step playbooks, comparing per-host results across reboots), use `scripts/spawn-fleet/spawn-fleet.sh`. It's built on the same `scripts/lib/vm.sh` as the runner, so VMs carry a run ID, images come from the local cache before `--image-root`, and no `sudo` is needed (be in the `libvirt` group). Unlike the runner, it:
 
-- Reads a manifest of `alias COUNT` pairs (one line per distro, one VM per count) instead of the `--only` filter.
-- Does **not** run a scanner. Boot completes, IP is captured, the VM is left running.
-- Emits `inventory.ini` (Ansible INI format, grouped by distro family and alias) and `fleet.tsv` (vmname / alias / family / expected_id / ip).
-- Names VMs `dm-fleet-<alias>-NN` so multiple fleets coexist on one hypervisor.
+- reads a manifest of `alias COUNT` pairs (aliases from `distros.tsv`) instead of `--only`;
+- runs no scanner: each VM that comes up is left running, and a VM that doesn't is torn down;
+- writes `inventory.ini` (Ansible INI, grouped by distro family and alias) and `fleet.tsv` (vm / alias / family / expected_id / host[:port]);
+- names VMs `dm-<run-id>-<alias>-NN`, so fleets and matrix runs coexist on one hypervisor.
+
+Defaults are 2 vCPU, 2 GiB and 2 VMs booting at once; size `--parallel` to the host. FIPS guests reject ed25519 keys, so `--fips` needs an RSA or ECDSA `--ssh-key` (`scripts/fips-divergence.sh` generates one per run).
 
 ```bash
-cat > fleet.tsv <<'EOF'
-rhel10    1
-rocky10   1
-EOF
-
-scripts/spawn-fleet/spawn-fleet.sh \
-  --manifest ./fleet.tsv \
-  --memory 18432 \
-  --vcpus 2 \
-  --fips \
-  --results-dir ./fleet-fips/
-
-ansible -i ./fleet-fips/inventory.ini all -m ping
+printf 'rocky9 2\ndebian12 1\n' > fleet.txt
+scripts/spawn-fleet/spawn-fleet.sh --manifest ./fleet.txt --results-dir ./fleet/
+ansible -i ./fleet/inventory.ini all -m ping
+scripts/teardown-fleet.sh --results-dir ./fleet/
 ```
 
-The inventory emitter is a small Python helper at `scripts/spawn-fleet/inventory.py`; the bash script invokes it after IP capture. Easier to extend to YAML inventory or richer host vars later than to grow the bash.
-
-When you're done, `scripts/teardown-fleet.sh --results-dir ./fleet-fips/` destroys + undefines every VM listed in `fleet.tsv`. Idempotent; VMs that no longer exist are silently skipped.
+`teardown-fleet.sh` reads the run's registry (`vms.tsv`, `run-id`) and only removes VMs from that run. It's idempotent. The inventory emitter is `scripts/spawn-fleet/inventory.py`; a forwarded SSH port becomes `ansible_port`.
 
 ### Three FIPS infrastructure fixes baked in
 
 The FIPS path on EL10 hit three landmines during the fleet test that motivated this script. All three are handled inline:
 
 1. **`fips-mode-setup` removed from EL10's `crypto-policies-scripts`.** When `--fips` is set and the binary is absent, cloud-init falls back to `update-crypto-policies --set FIPS` + `grubby --update-kernel=ALL --args="fips=1"` + `dracut -f --regenerate-all` + `:>/etc/system-fips`.
-2. **libvirtd `--timeout` killing VMs mid-cloud-init reboot.** Pre-flight in `spawn-fleet.sh` detects a `--timeout` flag in `libvirtd.service` and prints the no-timeout drop-in for the operator to install. Not auto-installed (no privilege model for that).
+2. **libvirtd `--timeout` killing VMs mid-cloud-init reboot.** On hosts running the monolithic `libvirtd`, `spawn-fleet.sh` warns when `libvirtd.service` has a `--timeout` flag. Install the drop-in below (needs root; not done automatically). The modular `virtqemud` daemons stay up while any domain runs.
 3. **Separate `/boot` partition on LVM cloud images.** When `--fips` is set, the kernel cmdline gets `boot=UUID=$(findmnt -no UUID /boot)` if `/boot` is its own filesystem, so the dracut FIPS integrity check can find `/boot/.vmlinuz-*.hmac` pre-pivot.
 
 The libvirtd drop-in:
@@ -183,14 +174,23 @@ Reserved slot — populate by hand (SCC registration required, can't be scripted
 
 ### FIPS algorithm-fence divergence
 
-`.github/workflows/fips-divergence-regression.yml` boots a 2-VM fleet (one RHEL 10, one rebuild distro 10) under FIPS, runs the pqc-readiness zipapp (`pqc-readiness.pyz --json`) on each, and asserts the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
+`scripts/fips-divergence.sh` boots a 2-VM fleet (`rhel10` and `rocky10`, 2 vCPU / 4 GiB each) with FIPS enabled through `spawn-fleet`, runs the pqc-readiness zipapp (`pqc-readiness.pyz --json`) on each, and asserts that the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
 
 - The RHEL host must report **zero PQC KEMs and zero PQC signature algorithms** while FIPS is active. If it does not, RHEL's downstream FIPS-provider gating patches have regressed.
 - The rebuild host must report **non-zero PQC KEMs or signatures** while FIPS is active. If it does not, the rebuild started carrying the gating patches; investigate before relaxing the test.
 
 The assertion script is `scripts/check-fips-divergence.py`. The classifier (which distro IDs ship the patches) is a single frozenset at the top of that script — adding to it is a claim about a build, not a marketing statement.
 
-The workflow targets a `[self-hosted, libvirt]` runner, and none is registered, so every scheduled run has been cancelled. #28 replaces it with a local, on-demand run.
+Run it on demand; it tears the fleet down on exit (`--keep` leaves it running):
+
+```bash
+scripts/fips-divergence.sh                          # builds the zipapp from ../pqc-readiness, or downloads the latest release
+scripts/fips-divergence.sh --pqc-readiness ./pqc-readiness.pyz --image-root /mnt/media/iso/linux
+```
+
+FIPS sshd rejects ed25519 keys, so each run generates a throwaway RSA key in its results directory. RHEL images need a Red Hat login and usually live only on the shared image store. Without one, the RHEL half is skipped with a message, and the script exits 3 so a partial run isn't mistaken for a pass. Exit codes: 0 divergence holds; 1 or 2 divergence broken (see the assertion script); 3 partial run; 4 setup or fleet failure.
+
+This used to be a scheduled workflow, but it needed a self-hosted libvirt runner that was never registered, so every run was cancelled (#28).
 
 ## Known issues
 

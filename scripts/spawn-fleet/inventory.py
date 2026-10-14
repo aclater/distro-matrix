@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit an Ansible INI inventory for a spawn-fleet run.
 
-Reads fleet.tsv (rows: vmname \t alias \t family \t expected_id \t ip)
+Reads fleet.tsv (rows: vmname \t alias \t family \t expected_id \t host[:port])
 and writes inventory.ini grouped by distro family and by alias.  Lifted
 out of spawn-fleet.sh so the inventory shape can grow (host vars, YAML
 form, group_by-distro-minor) without churning the bash driver.
@@ -63,8 +63,13 @@ def render_inventory(
 
         for alias in sorted(alias_hosts):
             lines.append(f"[alias_{_slug(alias)}]")
-            for vm, ip in sorted(alias_hosts[alias]):
-                lines.append(f"{vm} ansible_host={ip}")
+            for vm, target in sorted(alias_hosts[alias]):
+                # spawn-fleet writes host, or host:port for forwarded SSH.
+                host, _, port = target.rpartition(":") if ":" in target else (target, "", "")
+                line = f"{vm} ansible_host={host}"
+                if port:
+                    line += f" ansible_port={port}"
+                lines.append(line)
             lines.append("")
 
         lines.append(f"[{group_name}:vars]")

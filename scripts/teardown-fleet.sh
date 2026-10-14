@@ -1,61 +1,52 @@
 #!/usr/bin/env bash
-# teardown-fleet.sh — destroy + undefine every VM listed in a spawn-fleet
-# results directory's fleet.tsv, then remove the disk overlays.
+# teardown-fleet.sh — destroy the VMs a spawn-fleet run created, and their
+# disks.
 #
-# Idempotent: VMs that no longer exist are silently skipped.  Disk
-# overlays are removed last; the script does not touch the upstream
-# qcow2 backing files.
+# Reads the run's registry (vms.tsv) and run ID from --results-dir and only
+# touches VMs named dm-<that run>-*, so it can't remove another run's VMs.
+# Idempotent: VMs that no longer exist are skipped. Upstream base images are
+# never touched.
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib/vm.sh disable=SC1091
+source "$SCRIPT_DIR/lib/vm.sh"
+
 RESULTS_DIR=""
-WORK_DIR=/var/lib/libvirt/images/pqc-fleet-work
 LIBVIRT_URI=qemu:///system
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --results-dir) RESULTS_DIR=$2; shift 2 ;;
-    --workdir)     RESULTS_DIR=$2; shift 2 ;;  # alias for symmetry
-    --work-dir)    WORK_DIR=$2; shift 2 ;;
-    --connect)     LIBVIRT_URI=$2; shift 2 ;;
+    --results-dir|--workdir) RESULTS_DIR=$2; shift 2 ;;
+    --connect) LIBVIRT_URI=$2; shift 2 ;;
     -h|--help)
-      cat <<EOF
-Usage: teardown-fleet.sh --results-dir <DIR> [--work-dir <DIR>] [--connect <URI>]
-EOF
-      exit 0
-      ;;
+      echo "Usage: teardown-fleet.sh --results-dir <DIR> [--connect <URI>]"
+      exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 [[ -d $RESULTS_DIR ]] || { echo "results dir missing: $RESULTS_DIR" >&2; exit 2; }
-fleet_tsv="$RESULTS_DIR/fleet.tsv"
-[[ -r $fleet_tsv ]] || { echo "fleet.tsv missing: $fleet_tsv" >&2; exit 2; }
+[[ -r $RESULTS_DIR/run-id && -r $RESULTS_DIR/vms.tsv ]] \
+  || { echo "no run-id/vms.tsv in $RESULTS_DIR (not a spawn-fleet results dir?)" >&2; exit 2; }
 
-log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+# Read by lib/vm.sh.
+# shellcheck disable=SC2034
+DM_LIBVIRT_URI=$LIBVIRT_URI
+DM_RUN_ID=$(< "$RESULTS_DIR/run-id")
 
-# Read first column (vm name) of every non-comment row
-mapfile -t vms < <(awk -F'\t' '!/^#/ && NF>=1 && $1 { print $1 }' "$fleet_tsv")
-
-log "tearing down ${#vms[@]} VM(s) from $fleet_tsv"
-for vm in "${vms[@]}"; do
-  if virsh --connect "$LIBVIRT_URI" dominfo "$vm" >/dev/null 2>&1; then
-    state=$(virsh --connect "$LIBVIRT_URI" domstate "$vm" 2>/dev/null || echo unknown)
-    if [[ $state == "running" ]]; then
-      virsh --connect "$LIBVIRT_URI" destroy "$vm" >/dev/null || true
-    fi
-    virsh --connect "$LIBVIRT_URI" undefine "$vm" --remove-all-storage >/dev/null 2>&1 \
-      || virsh --connect "$LIBVIRT_URI" undefine "$vm" >/dev/null 2>&1 \
-      || true
-    log "  removed: $vm"
+n=0
+while IFS=$'\t' read -r backend vm work; do
+  [[ -z $vm ]] && continue
+  if "dm_${backend}_exists" "$vm"; then
+    dm_destroy_vm "$backend" "$vm" "$work"
+    dm_log "removed: $vm"
+    n=$((n + 1))
   else
-    log "  not defined: $vm"
+    [[ -n $work && -d $work ]] && rm -rf "${work:?}"
+    dm_log "not defined: $vm"
   fi
-  # Remove any leftover overlay/cidata artifacts.  The :? guard makes
-  # rm refuse to expand WORK_DIR/$vm to "/" if either side is somehow
-  # empty — defense in depth for shellcheck SC2115.
-  if [[ -n $vm && -d $WORK_DIR/$vm ]]; then
-    rm -rf "${WORK_DIR:?}/${vm:?}" || true
-  fi
-done
+  rm -f "$RESULTS_DIR/keep/$vm"
+done < "$RESULTS_DIR/vms.tsv"
 
-log "done"
+dm_log "done: removed $n VM(s) from run $DM_RUN_ID"
