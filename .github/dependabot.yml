@@ -1,13 +1,16 @@
+# Keeps the commit-SHA pins in .github/workflows current (#26). Actions are
+# pinned by SHA so a moved tag can't change what runs in CI.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-      day: monday
-      time: "08:00"
-      timezone: "UTC"
-    open-pull-requests-limit: 5
-    labels:
-      - "type: infrastructure"
-      - "agent: claude-code"
+    # New releases wait two weeks before a PR is opened.
+    cooldown:
+      default-days: 14
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
