@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aclater/distro-matrix/schemas/pqc-readiness-report.schema.json",
+  "title": "pqc-readiness --json report (structural check)",
+  "description": "Minimal structural schema for the pqc-readiness JSON report, used by run-matrix.sh --schema. pqc-readiness doesn't publish a report schema; this checks the fields the matrix and its consumers rely on, not every field. Written against pqc-readiness 2.3.0 (report schema_version 1.7).",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "hostname", "arch", "os", "os_release", "openssl", "ssh_pqc", "sshd", "crypto_policy", "fips", "pqc_deployment_gap", "verdict", "exit_code"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "generated_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T"},
+    "hostname": {"type": "string"},
+    "arch": {"type": "string"},
+    "os": {"type": "string"},
+    "os_release": {
+      "type": "object",
+      "required": ["id", "version_id", "pretty_name"],
+      "properties": {
+        "id": {"type": ["string", "null"]},
+        "version_id": {"type": ["string", "null"]},
+        "pretty_name": {"type": ["string", "null"]}
+      }
+    },
+    "openssl": {
+      "type": "object",
+      "required": ["available"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "version": {"type": ["string", "null"]},
+        "kem_algorithms": {"type": ["array", "null"]},
+        "sig_algorithms": {"type": ["array", "null"]},
+        "tls_groups": {"type": ["object", "array", "null"]}
+      }
+    },
+    "ssh_pqc": {"type": "object", "required": ["available"], "properties": {"available": {"type": "boolean"}}},
+    "sshd": {"type": "object", "required": ["available"], "properties": {"available": {"type": "boolean"}}},
+    "crypto_policy": {"type": "object", "required": ["available"], "properties": {"available": {"type": "boolean"}}},
+    "fips": {"type": "object"},
+    "pqc_deployment_gap": {"type": "object", "required": ["protocols"], "properties": {"protocols": {"type": ["object", "array"]}}},
+    "verdict": {"type": "string"},
+    "exit_code": {"type": "integer", "minimum": 0}
+  }
+}

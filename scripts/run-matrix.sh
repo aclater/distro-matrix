@@ -35,6 +35,21 @@
 #   --disk GIB                Resize qcow2 to this GiB before boot (default: 10)
 #   --boot-timeout SEC        Max seconds for IP + SSH (default: 240)
 #   --scanner-timeout SEC     Max seconds for the scanner itself (default: 300)
+#   --schema PATH             Validate each result.json against this JSON Schema;
+#                             a violation fails that distro. Bundled:
+#                             schemas/pqc-readiness-report.schema.json. Uses
+#                             python3-jsonschema when importable (DM_PYTHON picks
+#                             the interpreter), else a built-in subset validator.
+#   --compare-scanner PATH    Also run this second scanner build on the same VM
+#                             (result-b.json) and write <alias>/compare.json, a diff
+#                             that ignores timestamps and benchmark numbers. The
+#                             difference count goes in the report; it doesn't
+#                             change the verdict.
+#   --compare-args 'STR'      Args for the compare scanner (default: --scanner-args)
+#   --ground-truth FILE       name<TAB>command lines run as root on each guest
+#                             after the scan; output saved to
+#                             <alias>/ground-truth/<name>.txt. Example:
+#                             ground-truth/pqc-readiness.tsv
 #   --ssh-key PATH            SSH pubkey to inject (default: first of
 #                             ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)
 #   --backend B               qemu (VMs launched through vm-run, inside the host's
@@ -78,6 +93,11 @@ MEMORY=1536
 DISK=10
 BOOT_TIMEOUT=240
 SCANNER_TIMEOUT=300
+SCHEMA=""
+COMPARE_SCANNER=""
+COMPARE_ARGS=__same__
+GROUND_TRUTH=""
+DM_PYTHON=${DM_PYTHON:-python3}
 SSH_KEY=$(dm_default_ssh_key || echo "$HOME/.ssh/id_ed25519.pub")
 PARALLEL=auto
 BACKEND=auto
@@ -102,6 +122,10 @@ while [[ $# -gt 0 ]]; do
     --disk) DISK=$2; shift 2 ;;
     --boot-timeout) BOOT_TIMEOUT=$2; shift 2 ;;
     --scanner-timeout) SCANNER_TIMEOUT=$2; shift 2 ;;
+    --schema) SCHEMA=$2; shift 2 ;;
+    --compare-scanner) COMPARE_SCANNER=$2; shift 2 ;;
+    --compare-args) COMPARE_ARGS=$2; shift 2 ;;
+    --ground-truth) GROUND_TRUTH=$2; shift 2 ;;
     --ssh-key) SSH_KEY=$2; shift 2 ;;
     --parallel) PARALLEL=$2; shift 2 ;;
     --backend) BACKEND=$2; shift 2 ;;
@@ -115,6 +139,10 @@ done
 
 [[ -n $SCANNER ]] || { echo "--scanner is required" >&2; usage 2; }
 [[ -r $SCANNER ]] || { echo "scanner not readable: $SCANNER" >&2; exit 2; }
+[[ -z $SCHEMA || -r $SCHEMA ]] || { echo "schema not readable: $SCHEMA" >&2; exit 2; }
+[[ -z $COMPARE_SCANNER || -r $COMPARE_SCANNER ]] || { echo "compare scanner not readable: $COMPARE_SCANNER" >&2; exit 2; }
+[[ -z $GROUND_TRUTH || -r $GROUND_TRUTH ]] || { echo "ground-truth file not readable: $GROUND_TRUTH" >&2; exit 2; }
+[[ $COMPARE_ARGS == __same__ ]] && COMPARE_ARGS=$SCANNER_ARGS
 [[ -r $DISTROS_FILE ]] || { echo "distros file not readable: $DISTROS_FILE" >&2; exit 2; }
 [[ -r $SSH_KEY ]] || { echo "ssh pubkey not readable: $SSH_KEY" >&2; exit 2; }
 [[ -d $IMAGE_ROOT ]] || echo "note: image-root $IMAGE_ROOT not present; using the local cache only" >&2
@@ -282,6 +310,35 @@ run_one() {
     dm_scp_from "$host" "$port" "/tmp/$f" "$out_dir/$f" >>"$out_dir/virt.log" 2>&1 || true
   done
 
+  if [[ -n $COMPARE_SCANNER ]]; then
+    step="run compare scanner"
+    log "[$alias] running compare scanner"
+    dm_scp_to "$host" "$port" "$COMPARE_SCANNER" /tmp/scanner-b >>"$out_dir/virt.log" 2>&1
+    dm_ssh "$host" "$port" "
+      sudo install -m 0755 /tmp/scanner-b /usr/local/bin/scanner-b
+      timeout ${SCANNER_TIMEOUT}s sudo /usr/local/bin/scanner-b $COMPARE_ARGS > /tmp/result-b.json 2> /tmp/stderr-b.log
+      echo \$? > /tmp/exit-code-b
+      sudo chown matrix: /tmp/result-b.json /tmp/stderr-b.log /tmp/exit-code-b
+    " 2>>"$out_dir/virt.log" || true
+    for f in result-b.json stderr-b.log exit-code-b; do
+      dm_scp_from "$host" "$port" "/tmp/$f" "$out_dir/$f" >>"$out_dir/virt.log" 2>&1 || true
+    done
+  fi
+
+  if [[ -n $GROUND_TRUTH ]]; then
+    step="collect ground truth"
+    mkdir -p "$out_dir/ground-truth"
+    local gt_name gt_cmd
+    while IFS=$'\t' read -r gt_name gt_cmd; do
+      [[ -z $gt_name || $gt_name == \#* || -z $gt_cmd ]] && continue
+      [[ $gt_name =~ ^[A-Za-z0-9._-]+$ ]] || { log "[$alias] skipping ground-truth entry with unsafe name: $gt_name"; continue; }
+      # base64 so the command reaches the guest's bash byte for byte; stdin
+      # from /dev/null so ssh doesn't swallow the rest of the list.
+      dm_ssh "$host" "$port" "echo $(printf '%s' "$gt_cmd" | base64 -w0) | base64 -d | sudo bash 2>&1; echo \"# exit: \$?\"" \
+        < /dev/null > "$out_dir/ground-truth/$gt_name.txt" 2>>"$out_dir/virt.log" || true
+    done < "$GROUND_TRUTH"
+  fi
+
   local exit_code detected_id="" verdict=FAIL notes=""
   exit_code=$(tr -d '[:space:]' < "$out_dir/exit-code" 2>/dev/null || echo "?")
   if [[ -r $out_dir/os-release ]]; then
@@ -303,6 +360,38 @@ run_one() {
     notes="scanner exited cleanly but produced empty stdout"
   else
     notes="scanner did not run cleanly (exit=$exit_code)"
+  fi
+
+  step="validate output"
+  local checks=()
+  if [[ -n $SCHEMA ]]; then
+    local label n
+    for f in result.json result-b.json; do
+      [[ -s $out_dir/$f ]] || continue
+      label=A; [[ $f == result-b.json ]] && label=B
+      if "$DM_PYTHON" "$REPO_ROOT/tools/validate_result.py" "$SCHEMA" "$out_dir/$f" \
+           > "$out_dir/schema-$label.txt" 2>>"$out_dir/virt.log"; then
+        checks+=("schema $label ok")
+      else
+        n=$(grep -c . "$out_dir/schema-$label.txt" || true)
+        checks+=("schema $label: $n error(s), see schema-$label.txt")
+        verdict=FAIL
+      fi
+    done
+  fi
+  if [[ -n $COMPARE_SCANNER ]]; then
+    if [[ -s $out_dir/result.json && -s $out_dir/result-b.json ]]; then
+      "$DM_PYTHON" "$REPO_ROOT/tools/json_diff.py" "$out_dir/result.json" "$out_dir/result-b.json" \
+        > "$out_dir/compare.json" 2>>"$out_dir/virt.log" || true
+      checks+=("compare: $(jq -r '.differences' "$out_dir/compare.json" 2>/dev/null || echo '?') difference(s)")
+    else
+      checks+=("compare: no output from $([[ -s $out_dir/result.json ]] && echo B || echo A)")
+    fi
+  fi
+  if (( ${#checks[@]} )); then
+    local joined
+    joined=$(IFS=';'; echo "${checks[*]}")
+    notes="${notes:+$notes; }${joined//;/; }"
   fi
 
   record "$alias" "$expected" "$detected_id" "$exit_code" "$((SECONDS - started))" "$verdict" "$notes"
