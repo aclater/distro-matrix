@@ -23,7 +23,9 @@ its output back and writes `results/<UTC ts>/report.md` and `summary.json`.
 (`dm-<run>-<alias>`), cleanup traps, image lookup (local cache by alias, then
 `--image-root`) and two backends. `--backend qemu` (the default when `vm-run`
 is on PATH) launches each VM through `vm-run` with user-mode networking;
-`--backend libvirt` uses `virt-install` on `qemu:///system`. `run-matrix.sh`
+`--backend libvirt` uses `virt-install` on `qemu:///system`. `--backend
+qemu-direct` is qemu without `vm-run`, for CI runners only (never picked by
+`auto`); locally, wrap it in `vm-run`. `run-matrix.sh`
 can also prepare guests before the scan (`--prepare`, e.g. Python 3.11 on
 EL8 and Leap 15.6), validate results against a schema (`--schema`), diff two
 scanner builds on the same VM (`--compare-scanner`) and capture ground-truth
@@ -59,6 +61,9 @@ shellcheck -s bash -e SC1091 scripts/*.sh scripts/lib/*.sh scripts/spawn-fleet/*
 for t in tests/*.sh; do bash "$t"; done   # offline tests (need qemu-img)
 ruff check scripts/ tools/
 ```
+
+CI also boots one image per PR (`.github/workflows/boot-test.yml`, debian13
+with `ci/scanner.sh`); a red boot test means the VM lifecycle broke.
 
 A change to runner behaviour must also be exercised on real VMs: at least
 one EL distro (`rocky9`) and one Debian-family distro (`ubuntu2604` or

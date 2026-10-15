@@ -175,6 +175,23 @@ Reserved slot — populate by hand (SCC registration required, can't be scripted
 
 ## Regression tests
 
+### CI boot test
+
+`.github/workflows/boot-test.yml` boots one cloud image through `scripts/run-matrix.sh` on every PR and push to main (#46), so regressions in the VM lifecycle (disk staging, cloud-init seed, SSH, cleanup) fail CI instead of surfacing on a local matrix run, as #43 did.
+
+- **Image:** a dated Debian 13 genericcloud build, pinned by its SHA-512 from Debian's `SHA512SUMS` (the workflow checks the publisher's file lists the pinned hash, then the image against it) and cached between runs.
+- **Backend:** `--backend qemu-direct`, because runners have no `vm-run`. It launches qemu directly, with KVM when the runner exposes `/dev/kvm` (the workflow opens up its permissions) and TCG otherwise, with a 900 s boot timeout instead of 240 s. `auto` never picks it: it bypasses the host's vCPU budget.
+- **Scanner:** `ci/scanner.sh`, a POSIX-sh stand-in that prints the guest's os-release identity as JSON, validated with `--schema schemas/ci-scanner.schema.json`. CI doesn't depend on pqc-readiness.
+- **Asserts:** PASS, `os_release.id == debian` and `version_id == 13`, a non-empty `console.log`, and no qemu process or work dir left behind. The report goes to the job summary; the guest console is printed on failure.
+
+The same run locally (wrap it in `vm-run` so it stays inside the host budget; the debian12 image works too):
+
+```bash
+vm-run --name dm-ci bash scripts/run-matrix.sh --backend qemu-direct \
+  --scanner ci/scanner.sh --schema schemas/ci-scanner.schema.json \
+  --only debian13 --vcpus 1 --memory 2048
+```
+
 ### FIPS algorithm-fence divergence
 
 `scripts/fips-divergence.sh` boots a 2-VM fleet (`rhel10` and `rocky10`, 2 vCPU / 4 GiB each) with FIPS enabled through `spawn-fleet`, runs the pqc-readiness zipapp (`pqc-readiness.pyz --json`) on each, and asserts that the divergence documented in [pqc-readiness/docs/findings/fips-algorithm-fence.md](https://github.com/aclater/pqc-readiness/blob/main/docs/findings/fips-algorithm-fence.md) holds in both directions:
@@ -235,13 +252,14 @@ results/
 ├── scripts/teardown-fleet.sh  destroys a spawn-fleet run
 ├── scripts/fips-divergence.sh FIPS fleet + scan + assertion, run locally
 ├── scripts/check-fips-divergence.py  FIPS algorithm-fence assertion
-├── schemas/                   report schema for --schema
+├── ci/scanner.sh              stand-in scanner for the CI boot test
+├── schemas/                   report schemas for --schema (pqc-readiness; CI scanner)
 ├── ground-truth/              command lists for --ground-truth
 ├── prepare/                   guest preparation for --prepare
 ├── tests/                     offline tests (tests/*.sh; need qemu-img)
 ├── docs/verification/         dated end-to-end verification runs
 ├── tools/gen-distros-tsv.py   regenerates distros.tsv from the image-cache manifest
-├── .github/                   CI (shellcheck, pre-commit, offline tests), Trivy + CodeQL, Scorecard, Dependabot
+├── .github/                   CI (shellcheck, pre-commit, offline tests, boot test), Trivy + CodeQL, Scorecard, Dependabot
 ├── .pre-commit-config.yaml    detect-secrets + shellcheck + hygiene hooks
 └── .secrets.baseline
 ```

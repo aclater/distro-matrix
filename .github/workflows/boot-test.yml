@@ -1,0 +1,97 @@
+name: Boot test
+
+# Boots one checksum-verified cloud image through scripts/run-matrix.sh on
+# every PR, so regressions in the VM lifecycle (disk staging, cloud-init seed,
+# SSH, cleanup) fail CI instead of a local matrix run (#46, after #43).
+# Runners have no vm-run, so it uses --backend qemu-direct: KVM when the
+# runner exposes /dev/kvm, otherwise TCG with a longer boot timeout.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boot:
+    name: Boot debian13 (qemu-direct)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # A dated Debian 13 genericcloud build, pinned with its SHA-512 from the
+      # publisher's SHA512SUMS. Bump all three together.
+      IMG_BUILD: 20260914-2601
+      IMG_FILE: debian-13-genericcloud-amd64-20260914-2601.qcow2
+      IMG_SHA512: 95e110dfcdbd0ed8a82a75ed9579802f9950cabf51a810dcc6388e81bc778188713878b9f28d583a0ea602fbf48b35996ae9ad37f584166d8fbd6489df248f53  # pragma: allowlist secret (image checksum)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Enable KVM if the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            sudo udevadm settle  # the permission change applies asynchronously
+          fi
+          if [ -w /dev/kvm ]; then
+            echo "ACCEL=kvm" >> "$GITHUB_ENV"; echo "accel: kvm"
+          else
+            echo "ACCEL=tcg" >> "$GITHUB_ENV"; echo "accel: tcg (no usable /dev/kvm)"
+          fi
+
+      - name: Install qemu and cloud-init tooling
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            qemu-system-x86 qemu-utils cloud-image-utils jq
+
+      - name: Cache the image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pqc-vm-matrix/images/debian13.qcow2
+          key: dm-image-debian13-${{ env.IMG_SHA512 }}
+
+      - name: Download and verify the image
+        run: |
+          set -euo pipefail
+          dest=~/.cache/pqc-vm-matrix/images/debian13.qcow2
+          base="https://cloud.debian.org/images/cloud/trixie/$IMG_BUILD"
+          mkdir -p "$(dirname "$dest")"
+          # The publisher's checksum file must list the pinned hash...
+          curl -fsSL --retry 3 "$base/SHA512SUMS" | grep -qxF "$IMG_SHA512  $IMG_FILE"
+          [ -s "$dest" ] || curl -fsSL --retry 3 -o "$dest" "$base/$IMG_FILE"
+          # ...and the image (fresh or cached) must match it.
+          echo "$IMG_SHA512  $dest" | sha512sum -c -
+
+      - name: SSH key for the guest
+        run: ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+
+      - name: Boot through run-matrix.sh
+        run: |
+          timeout_s=240
+          [ "$ACCEL" = tcg ] && timeout_s=900
+          scripts/run-matrix.sh --backend qemu-direct \
+            --scanner ci/scanner.sh --schema schemas/ci-scanner.schema.json \
+            --only debian13 --vcpus 2 --memory 2048 --boot-timeout "$timeout_s" \
+            --results-dir "$RUNNER_TEMP/results"
+
+      - name: Assert PASS, console captured, nothing left running
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/results"
+          jq -e '.pass == 1 and .fail == 0' "$r/summary.json"
+          jq -e '.os_release.id == "debian" and .os_release.version_id == "13"' "$r/debian13/result.json"
+          test -s "$r/debian13/console.log"
+          if pgrep -a qemu-system; then echo "qemu left running"; exit 1; fi
+          left=$(find /tmp/distro-matrix-work -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+          [ "$left" -eq 0 ] || { echo "work dirs left: $left"; exit 1; }
+          { echo "accel: $ACCEL"; echo; cat "$r/report.md"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show the guest console on failure
+        if: failure()
+        run: tail -n 120 "$RUNNER_TEMP"/results/*/console.log 2>/dev/null || true

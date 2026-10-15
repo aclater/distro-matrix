@@ -64,7 +64,11 @@
 #   --backend B               qemu (VMs launched through vm-run, inside the host's
 #                             vCPU budget), libvirt (virt-install on --connect), or
 #                             auto (default: qemu when vm-run, qemu-system-x86_64 and
-#                             /dev/kvm are available, else libvirt)
+#                             /dev/kvm are available, else libvirt). qemu-direct:
+#                             qemu without vm-run, for CI and hosts without it;
+#                             KVM if /dev/kvm is writable, else TCG. Never picked
+#                             by auto, since it bypasses the vCPU budget;
+#                             --parallel auto means 1.
 #   --parallel N|auto         Distros in flight at once. auto (default): with qemu,
 #                             vm-run's budget / --vcpus (vm-run still queues anything
 #                             over budget); with libvirt, 1. libvirt VMs bypass
@@ -162,8 +166,14 @@ done
 case $BACKEND in
   auto) if dm_qemu_available; then BACKEND=qemu; else BACKEND=libvirt; fi ;;
   qemu) dm_qemu_available || { echo "qemu backend needs vm-run, qemu-system-x86_64 and a writable /dev/kvm" >&2; exit 2; } ;;
+  qemu-direct)
+    dm_qemu_direct_available || { echo "qemu-direct needs qemu-system-x86_64" >&2; exit 2; }
+    # shellcheck disable=SC2034  # read by scripts/lib/vm.sh
+    DM_QEMU_DIRECT=1 BACKEND=qemu BACKEND_LABEL=qemu-direct
+    echo "note: qemu-direct bypasses vm-run's vCPU budget (accel: $([[ -w /dev/kvm ]] && echo kvm || echo tcg))" >&2
+    [[ $PARALLEL == auto ]] && PARALLEL=1 ;;
   libvirt) ;;
-  *) echo "unknown --backend: $BACKEND (qemu|libvirt|auto)" >&2; exit 2 ;;
+  *) echo "unknown --backend: $BACKEND (qemu|qemu-direct|libvirt|auto)" >&2; exit 2 ;;
 esac
 need=(cloud-localds qemu-img jq ssh scp python3)
 [[ $BACKEND == libvirt ]] && need+=(virsh virt-install)
@@ -435,7 +445,7 @@ run_one() {
 }
 
 # --- Drive the matrix (sequential or parallel) -----------------------------
-log "backend: $BACKEND, concurrency: $PARALLEL"
+log "backend: ${BACKEND_LABEL:-$BACKEND}, concurrency: $PARALLEL"
 for i in "${!ALIASES[@]}"; do
   while (( $(jobs -p -r | wc -l) >= PARALLEL )); do
     # `wait -n` exits 127 if no children (race: job finished between the
@@ -473,7 +483,7 @@ done
   echo
   echo "- timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- scanner: \`$SCANNER\`"
-  echo "- backend: $BACKEND"
+  echo "- backend: ${BACKEND_LABEL:-$BACKEND}"
   echo "- concurrency: $PARALLEL"
   echo "- distros: ${#ALIASES[@]} (pass: $N_PASS, fail: $N_FAIL)"
   echo

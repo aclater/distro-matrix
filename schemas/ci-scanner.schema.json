@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "distro-matrix CI test scanner output (ci/scanner.sh)",
+  "type": "object",
+  "required": [
+    "scanner",
+    "os_release",
+    "kernel"
+  ],
+  "properties": {
+    "scanner": {
+      "enum": [
+        "distro-matrix-ci"
+      ]
+    },
+    "os_release": {
+      "type": "object",
+      "required": [
+        "id",
+        "version_id",
+        "pretty_name"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9._-]+$"
+        },
+        "version_id": {
+          "type": "string"
+        },
+        "pretty_name": {
+          "type": "string",
+          "pattern": "."
+        }
+      }
+    },
+    "kernel": {
+      "type": "string",
+      "pattern": "."
+    }
+  },
+  "description": "Uses only keywords the built-in subset validator understands (type, enum, pattern, required, properties)."
+}
