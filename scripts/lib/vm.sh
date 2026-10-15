@@ -75,17 +75,33 @@ dm_destroy_vm() {
   fi
 }
 
-# Tear down everything this run registered. Children first: async jobs in
-# a non-interactive shell ignore SIGINT, so they would otherwise keep
-# booting VMs after the parent is gone.
+# Send SIG to PID and every descendant, children first.
+dm_kill_tree() {
+  local sig=$1 pid=$2 c
+  for c in $(pgrep -P "$pid" 2>/dev/null); do
+    dm_kill_tree "$sig" "$c"
+  done
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+
+# Tear down everything this run registered. Children first, as whole
+# process trees: async jobs in a non-interactive shell ignore SIGINT, and
+# the ssh/scp they run inherit that, so Ctrl-C reaches none of them. A
+# subshell also defers its TERM trap until its foreground ssh exits, which
+# can be minutes (a --prepare dnf, a scanner run). Terminating the trees
+# makes an interrupt take seconds, not the remaining command time.
 dm_cleanup_all() {
   local rc=$?
   trap - EXIT INT TERM
-  local pids
+  local pids p _
   pids=$(jobs -p)
   if [[ -n $pids ]]; then
-    # shellcheck disable=SC2086  # word-split the PID list on purpose
-    kill -TERM $pids 2>/dev/null || true
+    for p in $pids; do dm_kill_tree TERM "$p"; done
+    for _ in $(seq 1 20); do
+      jobs -pr | grep -q . || break
+      sleep 0.5
+    done
+    for p in $(jobs -pr); do dm_kill_tree KILL "$p"; done
     wait 2>/dev/null || true
   fi
   if [[ -s ${DM_REGISTRY:-} ]]; then
