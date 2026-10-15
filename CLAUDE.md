@@ -49,6 +49,14 @@ command output (`--ground-truth`). `spawn-fleet.sh` takes the same
   shared store is `/mnt/media/iso/linux/<distro-dir>/<dated filename>` (NFS
   from saturn, only reachable at home). Verify publisher checksums before
   adding an image. RHEL images need a Red Hat login and live only on saturn.
+- **RHSM credentials never leave the keyring.** RHEL guests are registered
+  from `secret-tool` entries (service `rhsm`, accounts
+  `distro-matrix-activation-key` and `distro-matrix-org`) or `DM_RHSM_*` env
+  in CI. Never put them in argv, files, logs, results, seeds or commits; pass
+  them over ssh stdin as `dm_rhsm_register` does. Every registered guest must
+  be unregistered before it's destroyed (the cleanup paths do this; keep it
+  that way). Run `scripts/check-no-secrets.sh <results> <work>` after any
+  change to that code.
 - **Verify versions** of actions, images and packages from a primary source
   (GitHub API, registry) before using them; actions are pinned by commit SHA
   with the tag as a comment, at least two weeks old.

@@ -23,7 +23,10 @@ DM_SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
              -o LogLevel=ERROR -o ConnectTimeout=10
              -o BatchMode=yes -o GlobalKnownHostsFile=/dev/null)
 
-dm_log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+# Log to the stderr the run started with (DM_LOG_FD, saved by dm_init), so
+# messages from EXIT traps reach the run log even when a trap fires while a
+# command's stderr is redirected (e.g. into prepare.log).
+dm_log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&"${DM_LOG_FD:-2}"; }
 
 # First existing default public key, preferring ed25519 (FIPS hosts that
 # reject ed25519 need --ssh-key with an RSA key).
@@ -49,6 +52,7 @@ dm_init() {
   mkdir -p "$DM_RESULTS_DIR" "$DM_WORK_DIR"
   : >> "$DM_REGISTRY"
   echo "$DM_RUN_ID" > "$DM_RESULTS_DIR/run-id"
+  exec {DM_LOG_FD}>&2
   trap dm_cleanup_all EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -114,6 +118,9 @@ dm_cleanup_all() {
       fi
       if "dm_${backend}_exists" "$vm"; then
         dm_log "[$vm] cleanup"
+        # Unregister from RHSM (#58) while the guest is still alive; a no-op
+        # unless this VM left a registration marker.
+        dm_rhsm_unregister "$vm"
         dm_destroy_vm "$backend" "$vm" "$work"
       elif [[ -n $work && -d $work ]]; then
         rm -rf "${work:?}"
@@ -378,4 +385,95 @@ dm_wait_ssh() {
     sleep 5
   done
   return 1
+}
+
+# --- Red Hat Subscription Management (RHEL guests) -------------------------
+#
+# RHEL cloud images ship with no enabled repositories until registered (#58).
+# Credentials come from the host's keyring, or env for CI:
+#   secret-tool store --label=... service rhsm account distro-matrix-activation-key
+#   secret-tool store --label=... service rhsm account distro-matrix-org
+#   (or DM_RHSM_ACTIVATION_KEY / DM_RHSM_ORG in the environment, for CI)
+# They live only in non-exported shell variables and reach the guest over ssh
+# stdin: never in a file, a log, the results, the cloud-init seed, or any
+# process argv on the host. Every registered guest leaves a marker
+# ($DM_RESULTS_DIR/rhsm/<vm>: ssh target and system UUID, nothing secret) and
+# is unregistered from that marker before the VM is destroyed, by whichever
+# cleanup path gets there first (per-distro trap or the parent's backstop).
+
+DMR_KEY="" DMR_ORG=""
+
+# dm_rhsm_load: fill DMR_KEY/DMR_ORG (plain, never-exported variables);
+# returns 1 if either is missing. Env (CI) wins over the keyring; the env
+# copies are then un-exported so no child process (ssh, qemu) inherits them.
+dm_rhsm_load() {
+  DMR_KEY=${DM_RHSM_ACTIVATION_KEY:-}
+  DMR_ORG=${DM_RHSM_ORG:-${DM_RHSM_ORG_ID:-}}
+  export -n DM_RHSM_ACTIVATION_KEY DM_RHSM_ORG DM_RHSM_ORG_ID 2>/dev/null || true
+  if [[ -z $DMR_KEY || -z $DMR_ORG ]] && command -v secret-tool >/dev/null; then
+    [[ -n $DMR_KEY ]] || DMR_KEY=$(secret-tool lookup service rhsm account distro-matrix-activation-key 2>/dev/null || true)
+    [[ -n $DMR_ORG ]] || DMR_ORG=$(secret-tool lookup service rhsm account distro-matrix-org 2>/dev/null || true)
+  fi
+  [[ -n $DMR_KEY && -n $DMR_ORG ]]
+}
+
+# shellcheck disable=SC2034  # used by run-matrix.sh
+DM_RHSM_HINT="RHEL guests need registering for dnf: store an activation key and org ID in the keyring (secret-tool store --label='Red Hat activation key' service rhsm account distro-matrix-activation-key; same with account distro-matrix-org) or set DM_RHSM_ACTIVATION_KEY and DM_RHSM_ORG"
+
+# dm_rhsm_redact TEXT -> TEXT with the credentials replaced, in-process.
+dm_rhsm_redact() {
+  local t=$1
+  [[ -n $DMR_KEY ]] && t=${t//"$DMR_KEY"/[REDACTED-ACTIVATION-KEY]}
+  [[ -n $DMR_ORG ]] && t=${t//"$DMR_ORG"/[REDACTED-ORG]}
+  printf '%s\n' "$t"
+}
+
+# dm_guest_os_id HOST PORT -> the guest's os-release ID.
+dm_guest_os_id() {
+  # shellcheck disable=SC2016  # expands in the guest, not here
+  dm_ssh "$1" "$2" '. /etc/os-release && printf %s "$ID"' < /dev/null 2>/dev/null
+}
+
+# dm_rhsm_register HOST PORT VM LOG: register the guest; append redacted
+# output to LOG; write the marker. Returns non-zero on failure.
+dm_rhsm_register() {
+  local host=$1 port=$2 vm=$3 logf=$4 out rc uuid
+  mkdir -p "$DM_RESULTS_DIR/rhsm"
+  # Marker first: if we're interrupted mid-register, cleanup still tries to
+  # unregister (a no-op on a guest that never registered).
+  printf 'target=%s %s\nuuid=\n' "$host" "$port" > "$DM_RESULTS_DIR/rhsm/$vm"
+  # Org and key travel on stdin (printf is a builtin: nothing reaches host
+  # argv). In the guest a root shell reads them, so sudo logs only this
+  # script's text, never the expanded --activationkey argument.
+  set +e
+  # shellcheck disable=SC2016  # $o/$k expand in the guest's root shell
+  out=$(printf '%s\n%s\n' "$DMR_ORG" "$DMR_KEY" | dm_ssh "$host" "$port" \
+    "sudo bash -c 'IFS= read -r o; IFS= read -r k; subscription-manager register --org \"\$o\" --activationkey \"\$k\" 2>&1; rc=\$?; unset o k; exit \$rc'" 2>&1)
+  rc=$?
+  set -e
+  { printf '### subscription-manager register (credentials redacted)\n'; dm_rhsm_redact "$out"; } >> "$logf"
+  (( rc == 0 )) || return "$rc"
+  uuid=$(dm_ssh "$host" "$port" 'sudo subscription-manager identity 2>/dev/null' < /dev/null 2>/dev/null |
+         awk -F': ' '/system identity/{print $2; exit}')
+  printf 'target=%s %s\nuuid=%s\n' "$host" "$port" "$uuid" > "$DM_RESULTS_DIR/rhsm/$vm"
+  dm_log "[$vm] registered with Red Hat Subscription Management (system $uuid)"
+}
+
+# dm_rhsm_unregister VM: unregister if a marker exists; remove the marker on
+# success; on failure, log the system UUID so it can be removed by hand.
+dm_rhsm_unregister() {
+  local vm=$1 m="${DM_RESULTS_DIR:-}/rhsm/$1" target uuid host port out
+  [[ -n ${DM_RESULTS_DIR:-} && -e $m ]] || return 0
+  target=$(sed -n 's/^target=//p' "$m"); uuid=$(sed -n 's/^uuid=//p' "$m")
+  read -r host port <<< "$target"
+  if out=$(timeout 90 ssh "${DM_SSH_OPTS[@]}" -p "$port" -i "${DM_SSH_KEY%.pub}" "matrix@$host" \
+        'if sudo subscription-manager identity >/dev/null 2>&1; then sudo subscription-manager unregister; else echo "not registered"; fi' \
+        < /dev/null 2>&1); then
+    rm -f "$m"
+    dm_log "[$vm] unregistered from Red Hat Subscription Management ($(tail -1 <<< "$out"))"
+  else
+    rm -f "$m"
+    dm_log "[$vm] WARNING: could not unregister RHSM system ${uuid:-<uuid unknown>}; remove it at https://console.redhat.com/insights/inventory (output: $(tail -1 <<< "$out"))"
+    printf '%s\t%s\n' "$vm" "${uuid:-unknown}" >> "$DM_RESULTS_DIR/rhsm-unregister-failed.tsv"
+  fi
 }

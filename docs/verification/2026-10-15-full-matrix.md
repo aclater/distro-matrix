@@ -32,7 +32,7 @@ The documented cause of the divergence is RHEL's downstream FIPS-provider
 gating, not the version; a future run with matching versions would rule the
 version out completely.
 
-## All 23 distros: 22 PASS, 1 FAIL
+## All 23 distros: 22 PASS, 1 FAIL (rhel8 fixed later the same day, see the update below)
 
 ```bash
 scripts/run-matrix.sh --scanner pqc-readiness-2.4.0.pyz --scanner-args '--json --scan-services' \
@@ -93,3 +93,39 @@ Across the 22 passing distros, the compare diffs contain only:
 No PQC capability, configuration or verdict field changed on a booted stock
 host, which matches pqc-readiness's own finding: its 2.3/2.4 accuracy fixes
 change results only for `--host-mount` and offline scans.
+
+## Update: rhel8 passes with RHSM registration (#58), 23/23
+
+RHEL guests are now registered with Red Hat Subscription Management for
+`--prepare` (activation key and org ID from the host keyring) and unregistered
+before teardown. Same command as above, `--only rhel8,rhel9,rhel10`,
+pqc-readiness 2.4.0 vs 2.3.0:
+
+| Alias | Detected ID | Exit | Duration | Verdict | rhsm_registered | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| rhel10 | rhel | 3 | 47s | PASS | true | schema A ok; schema B ok; compare: 1 difference(s) |
+| rhel8 | rhel | 3 | 156s | PASS | true | schema A ok; schema B ok; compare: 1 difference(s) |
+| rhel9 | rhel | 3 | 63s | PASS | true | schema A ok; schema B ok; compare: 2 difference(s) |
+
+With the 22 passing distros from the full run, **all 23 distros in
+`distros.tsv` pass**.
+
+Checks on the credential handling and cleanup:
+
+- **Unregister on every path:** 7 test registrations across 5 runs, including
+  two Ctrl-C interrupts sent while `dnf install python3.11` was running, and 7
+  "System has been unregistered." responses, matched by system UUID. After the
+  interrupt the runner exited in 7 s, the unregister ran 6 s after the signal,
+  and no VM, work dir or registration marker was left.
+- **No leaks:** `scripts/check-no-secrets.sh` found no credentials in any run's
+  results, work dir or log. Host process arguments were sampled every 4 s
+  during runs (with `/usr/bin/grep` reading the pattern from a file
+  descriptor): no match.
+- **Fixed during validation:** the first version passed the credentials as
+  `sudo subscription-manager register --activationkey ...`, which made sudo
+  log the key in the guest's journal. It was found by scanning the live
+  guest's disk overlay. The register now runs inside a root shell that reads
+  them from stdin; repeated disk scans over a two-minute registered window
+  found nothing. Trap-time log lines (like the unregister after Ctrl-C) now go
+  to the run log instead of whichever file the interrupted command was
+  writing.
