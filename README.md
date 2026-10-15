@@ -146,7 +146,7 @@ The matrix's job is *"did the script run on this OS"*, not *"what verdict did th
 
 NFS-mounted qcow2s, 10 GbE direct between lennon and the storage host. The thin backing-file overlay means VM startup reads the base image lazily over NFS — no per-VM copy.
 
-On a laptop (24-core Framework, local images, `--no-backing` full copies, 1 vCPU / 2 GiB per VM), `rocky9` and `ubuntu2604` ran sequentially in 66s, 31s and 35s each (2026-10-14).
+On a laptop (24-core Framework, local images, qemu backend, 18-vCPU vm-run budget), all 18 cached distros ran with a compare build, schema checks, ground truth and `--prepare` in 4 min 27 s (2026-10-15); most distros take 20-45 s, and the four that need `--prepare` 3-5 minutes. The full results and the rest of the checklist are in [docs/verification/2026-10-15.md](docs/verification/2026-10-15.md).
 
 ## Supported distros
 
@@ -230,11 +230,18 @@ results/
 ├── README.md                  this file
 ├── distros.tsv                the matrix (generated; see tools/)
 ├── scripts/run-matrix.sh      the one-shot runner
+├── scripts/lib/vm.sh          shared VM lifecycle: backends, run IDs, cleanup, image lookup
 ├── scripts/spawn-fleet/       keep-alive fleets + Ansible inventory
 ├── scripts/teardown-fleet.sh  destroys a spawn-fleet run
+├── scripts/fips-divergence.sh FIPS fleet + scan + assertion, run locally
 ├── scripts/check-fips-divergence.py  FIPS algorithm-fence assertion
+├── schemas/                   report schema for --schema
+├── ground-truth/              command lists for --ground-truth
+├── prepare/                   guest preparation for --prepare
+├── tests/                     offline tests (tests/*.sh; need qemu-img)
+├── docs/verification/         dated end-to-end verification runs
 ├── tools/gen-distros-tsv.py   regenerates distros.tsv from the image-cache manifest
-├── .github/                   CI (shellcheck, pre-commit), Trivy + CodeQL, Scorecard, Dependabot
+├── .github/                   CI (shellcheck, pre-commit, offline tests), Trivy + CodeQL, Scorecard, Dependabot
 ├── .pre-commit-config.yaml    detect-secrets + shellcheck + hygiene hooks
 └── .secrets.baseline
 ```
