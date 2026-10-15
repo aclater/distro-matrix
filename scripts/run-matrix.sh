@@ -213,6 +213,15 @@ DM_LIBVIRT_URI=$LIBVIRT_URI
 DM_SSH_KEY=$SSH_KEY
 dm_init
 
+# RHEL guests are registered with Red Hat Subscription Management for
+# --prepare when credentials are in the keyring or env (#58). Loaded once
+# here; the plain (non-exported) variables reach run_one's subshells.
+RHSM_AVAILABLE=0
+if [[ -n $PREPARE ]] && dm_rhsm_load; then
+  RHSM_AVAILABLE=1
+  log "RHSM credentials found; RHEL guests will be registered for --prepare and unregistered before teardown"
+fi
+
 # --- Parse distros.tsv -----------------------------------------------------
 declare -a ALIASES FAMILIES EXPECTED_OS QCOW_RELPATHS
 while IFS=$'\t' read -r alias family expected_os qcow_relpath; do
@@ -278,7 +287,10 @@ run_one() {
     if [[ $(cut -f6 "$out_dir/record.tsv" 2>/dev/null) == FAIL && $KEEP_ON_FAILURE -eq 1 ]]; then
       dm_keep "$vm"
       log "[$alias] keeping $vm + $work (debug)"
+      [[ -e $RESULTS_DIR/rhsm/$vm ]] && log "[$alias] $vm is still registered with RHSM; run 'sudo subscription-manager unregister' in it before destroying it"
     elif "dm_${BACKEND}_exists" "$vm" || [[ -d $work ]]; then
+      # Unregister while the guest is still alive (#58).
+      dm_rhsm_unregister "$vm"
       dm_destroy_vm "$BACKEND" "$vm" "$work"
     fi
   }
@@ -322,6 +334,21 @@ run_one() {
   log "[$alias] ssh $host:$port"
 
   if [[ -n $PREPARE ]]; then
+    local guest_id
+    guest_id=$(dm_guest_os_id "$host" "$port" || true)
+    if [[ $guest_id == rhel ]]; then
+      if (( RHSM_AVAILABLE )); then
+        step="register with RHSM"
+        log "[$alias] registering with Red Hat Subscription Management"
+        if ! dm_rhsm_register "$host" "$port" "$vm" "$out_dir/prepare.log"; then
+          fail "RHSM registration failed (see $out_dir/prepare.log)"
+          return
+        fi
+        echo true > "$out_dir/rhsm-registered"
+      else
+        log "[$alias] RHEL guest and no RHSM credentials: not registering"
+      fi
+    fi
     step="prepare guest"
     local p_key p_cmd
     while IFS=$'\t' read -r p_key p_cmd; do
@@ -333,7 +360,11 @@ run_one() {
       # from /dev/null so ssh doesn't swallow the rest of the file.
       if ! dm_ssh "$host" "$port" "sudo mkdir -p /etc/distro-matrix && echo $(printf '%s' "$p_cmd" | base64 -w0) | base64 -d | sudo timeout ${PREPARE_TIMEOUT}s bash" \
           < /dev/null >> "$out_dir/prepare.log" 2>&1; then
-        fail "prepare failed: $p_cmd (see $out_dir/prepare.log)"
+        if [[ $guest_id == rhel ]] && (( ! RHSM_AVAILABLE )); then
+          fail "prepare failed: $p_cmd (see $out_dir/prepare.log). $DM_RHSM_HINT"
+        else
+          fail "prepare failed: $p_cmd (see $out_dir/prepare.log)"
+        fi
         return
       fi
     done < "$PREPARE"
@@ -458,9 +489,10 @@ wait
 
 # --- Aggregate per-distro records ------------------------------------------
 declare -i N_PASS=0 N_FAIL=0
-declare -a ROW_ALIAS ROW_EXPECTED ROW_DETECTED ROW_EXIT ROW_DURATION ROW_VERDICT ROW_NOTES
+declare -a ROW_ALIAS ROW_EXPECTED ROW_DETECTED ROW_EXIT ROW_DURATION ROW_VERDICT ROW_NOTES ROW_RHSM
 for alias in "${ALIASES[@]}"; do
   rec="$RESULTS_DIR/$alias/record.tsv"
+  if [[ -e $RESULTS_DIR/$alias/rhsm-registered ]]; then ROW_RHSM+=(true); else ROW_RHSM+=(false); fi
   if [[ ! -r $rec ]]; then
     ROW_ALIAS+=("$alias"); ROW_EXPECTED+=("?"); ROW_DETECTED+=(""); ROW_EXIT+=("?")
     ROW_DURATION+=("0"); ROW_VERDICT+=("FAIL"); ROW_NOTES+=("no record file (run_one crashed)")
@@ -506,7 +538,8 @@ done
            --arg d "${ROW_DETECTED[$i]}" --arg x "${ROW_EXIT[$i]}" \
            --argjson dur "${ROW_DURATION[$i]}" \
            --arg v "${ROW_VERDICT[$i]}" --arg n "${ROW_NOTES[$i]}" \
-           '{alias:$a, expected_id:$e, detected_id:$d, exit:$x, duration_s:$dur, verdict:$v, notes:$n}'
+           --argjson rhsm "${ROW_RHSM[$i]}" \
+           '{alias:$a, expected_id:$e, detected_id:$d, exit:$x, duration_s:$dur, verdict:$v, notes:$n, rhsm_registered:$rhsm}'
   done
   printf ']}\n'
 } > "$SUMMARY_JSON"

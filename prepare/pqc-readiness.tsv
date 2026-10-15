@@ -5,8 +5,10 @@
 # so install a newer one, as pqc-readiness's README tells users, and point
 # the runner at it through /etc/distro-matrix/interpreter.
 #
-# EL 8.8+ has python3.11 in AppStream. rhel8 needs a registered system (or
-# a local repo) for dnf to reach it.
+# EL 8.8+ has python3.11 in AppStream. rhel8's cloud image has no enabled
+# repositories until registered: run-matrix registers RHEL guests with RHSM
+# before these commands when credentials are in the keyring (#58; see README,
+# "RHEL guests and subscriptions") and unregisters them before teardown.
 alma8	dnf -y -q install python3.11 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter
 rocky8	dnf -y -q install python3.11 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter
 ol8	dnf -y -q install python3.11 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter

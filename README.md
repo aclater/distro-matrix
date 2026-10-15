@@ -57,7 +57,21 @@ test-on-distros --scanner ./dist/pqc-readiness.pyz --scanner-args '--json' --onl
 - **`--schema schemas/pqc-readiness-report.schema.json`** validates each `result.json`; a violation fails that distro and the errors land in `<alias>/schema-A.txt`. The bundled schema is structural: it checks the fields the matrix and its consumers rely on, since pqc-readiness doesn't publish a report schema. It uses `python3-jsonschema` when importable (set `DM_PYTHON` to choose the interpreter), else a small built-in validator for the subset the schema uses.
 - **`--compare-scanner PATH`** runs a second scanner build on the same booted VM and writes `<alias>/compare.json`, a JSON diff that ignores timestamps and benchmark numbers. The difference count goes in the report's Notes; it doesn't change the verdict. This is the before/after check for a scanner change.
 - **`--prepare prepare/pqc-readiness.tsv`** runs each matching `key<TAB>command` line as root after SSH is up and before the scanner; `key` is an alias, a family from `distros.tsv`, or `*`. Output goes to `<alias>/prepare.log`, and a failing command fails the distro with its own reason. A command may write an interpreter path to `/etc/distro-matrix/interpreter`; both scanners then run as `<interpreter> scanner` instead of through their shebang. The pqc-readiness file installs Python 3.11 on EL8 (alma8, rocky8, ol8, rhel8) and Leap 15.6, whose Python 3.6 (or missing `python3`) can't run it. Preparation adds 3-5 minutes per guest, mostly package metadata. `--prepare-timeout` caps each command (default 900 s).
+- **RHEL guests are registered with Red Hat Subscription Management for `--prepare`** (#58), because RHEL cloud images have no enabled repositories until registered (rhel8 needs one to install Python 3.11). It happens only for guests whose `os-release` `ID` is `rhel` (not Rocky, Alma or Oracle Linux) and only when credentials are configured. See [RHEL guests and subscriptions](#rhel-guests-and-subscriptions).
 - **`--ground-truth ground-truth/pqc-readiness.tsv`** runs each `name<TAB>command` line as root on the guest after the scan and saves `<alias>/ground-truth/<name>.txt`: `ssh -Q kex`, `sshd -T`, `openssl list`, the crypto policy, rpm/dpkg package lists. That's what the scanner's output should agree with.
+
+### RHEL guests and subscriptions
+
+Store an activation key and your org ID in the host's keyring once (or export `DM_RHSM_ACTIVATION_KEY` and `DM_RHSM_ORG` in CI):
+
+```bash
+secret-tool store --label='Red Hat activation key (distro-matrix)' service rhsm account distro-matrix-activation-key
+secret-tool store --label='Red Hat org ID (distro-matrix)' service rhsm account distro-matrix-org
+```
+
+With `--prepare`, each RHEL guest is then registered before the prepare commands and **unregistered before the VM is destroyed**, on success, failure, timeout and Ctrl-C alike (the per-distro cleanup and the parent's interrupt backstop both unregister from a marker in `<results>/rhsm/`). If an unregister fails, the run logs the system's UUID and records it in `<results>/rhsm-unregister-failed.tsv` so you can remove it at console.redhat.com. `summary.json` records `rhsm_registered: true|false` per distro.
+
+How the credentials are kept out of everything: they're read into non-exported shell variables (env copies are un-exported, so no child process inherits them), sent to the guest over the ssh session's stdin, and read there by a root shell so they don't show up in the guest's sudo log either. They never appear in a host process's arguments, the cloud-init seed, the results, the logs or the console capture; captured output is redacted in-process. `scripts/check-no-secrets.sh DIR...` greps a results or work dir for them (it reads the pattern through a file descriptor, not argv), and `tests/test-rhsm-secrets.sh` checks the handling offline in CI. Without credentials, rhel8's prepare step fails with "no enabled repositories" and a hint on configuring them; rhel9 and rhel10 need no preparation.
 
 ## Keep-alive fleets — `spawn-fleet.sh`
 
@@ -146,14 +160,14 @@ The matrix's job is *"did the script run on this OS"*, not *"what verdict did th
 
 NFS-mounted qcow2s, 10 GbE direct between lennon and the storage host. The thin backing-file overlay means VM startup reads the base image lazily over NFS — no per-VM copy.
 
-On a laptop (24-core Framework, local images, qemu backend, 18-vCPU vm-run budget), all 18 cached distros ran with a compare build, schema checks, ground truth and `--prepare` in 4 min 27 s (2026-10-15); most distros take 20-45 s, and the four that need `--prepare` 3-5 minutes. The full results and the rest of the checklist are in [docs/verification/2026-10-15.md](docs/verification/2026-10-15.md). With every image in the local cache (RHEL and the other store-only images copied in), **22 of the 23 distros in `distros.tsv` pass** in 3 min 46 s; `rhel8` fails in preparation until #58 lands ([docs/verification/2026-10-15-full-matrix.md](docs/verification/2026-10-15-full-matrix.md)).
+On a laptop (24-core Framework, local images, qemu backend, 18-vCPU vm-run budget), all 18 cached distros ran with a compare build, schema checks, ground truth and `--prepare` in 4 min 27 s (2026-10-15); most distros take 20-45 s, and the four that need `--prepare` 3-5 minutes. The full results and the rest of the checklist are in [docs/verification/2026-10-15.md](docs/verification/2026-10-15.md). With every image in the local cache (RHEL and the other store-only images copied in), **all 23 distros in `distros.tsv` pass**: 22 in the full run (3 min 46 s), and `rhel8` once RHEL guests are registered with RHSM for `--prepare` (#58; [docs/verification/2026-10-15-full-matrix.md](docs/verification/2026-10-15-full-matrix.md)).
 
 ## Supported distros
 
 | Family | Aliases |
 | --- | --- |
 | EL | `rhel{8,9,10}`, `rocky{8,9,10}`, `alma{8,9,10}`, `stream{9,10}`, `fedora{43,44}`, `ol{8,9}`, `al2023` |
-| Debian | `debian13`, `ubuntu2404`, `ubuntu2604` (`debian12` disabled, see [#3](https://github.com/aclater/distro-matrix/issues/3)) |
+| Debian | `debian12`, `debian13`, `ubuntu2404`, `ubuntu2604` (`debian12` boots since the virtio cloud-init seed fix, [#3](https://github.com/aclater/distro-matrix/issues/3)) |
 | SUSE | `leap156`, `leap16`, `tumbleweed` (SLES needs a manual SCC download, see below) |
 
 `distros.tsv` is the source of truth. It's generated by `tools/gen-distros-tsv.py` from the image-cache manifest, and aliases match the cache's `<alias>.qcow2` names.
@@ -217,7 +231,7 @@ This used to be a scheduled workflow, but it needed a self-hosted libvirt runner
 ## Known issues
 
 - **RHEL images need a Red Hat login to download** and live on the shared image store. Copy them once into the local cache (`~/.cache/pqc-vm-matrix/images/rhel8.qcow2` etc.) and they work anywhere, or pass `--image-root /mnt/media/iso/linux` at home. Without either, `rhel8`, `rhel9` and `rhel10` fail at once with "image not found locally".
-- **`rhel8` preparation fails on the unregistered cloud image:** it has no enabled repositories, so `dnf install python3.11` can't run (#58, which proposes the UBI 8 repositories or an activation key). `rhel9` and `rhel10` need no preparation and pass.
+- **`rhel8` preparation needs RHSM credentials** (see [RHEL guests and subscriptions](#rhel-guests-and-subscriptions)); without them its prepare step fails with "no enabled repositories". `rhel9` and `rhel10` need no preparation and pass either way.
 
 ## Output layout
 
