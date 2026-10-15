@@ -38,6 +38,9 @@ DM_RUN_ID=$(< "$RESULTS_DIR/run-id")
 n=0
 while IFS=$'\t' read -r backend vm work; do
   [[ -z $vm ]] && continue
+  # The qemu backend keeps a VM's pid file and SSH port in its work dir.
+  # shellcheck disable=SC2034  # read by lib/vm.sh
+  DM_WORK_DIR=$(dirname "$work")
   if "dm_${backend}_exists" "$vm"; then
     dm_destroy_vm "$backend" "$vm" "$work"
     dm_log "removed: $vm"

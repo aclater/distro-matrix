@@ -4,8 +4,10 @@
 #
 # Built on scripts/lib/vm.sh, like run-matrix.sh: VM names carry a run ID
 # (dm-<run>-<alias>-NN), images resolve from the local cache before
-# --image-root, and no sudo is needed (the user must be in the libvirt
-# group). Unlike run-matrix.sh, it runs no scanner and leaves every VM that
+# --image-root, and no sudo is needed. The default qemu backend launches
+# each VM through ~/.local/bin/vm-run, inside the host's vCPU budget, with an
+# SSH port forward on 127.0.0.1; --backend libvirt uses virt-install (the
+# user must be in the libvirt group, and those VMs bypass the budget). Unlike run-matrix.sh, it runs no scanner and leaves every VM that
 # came up running; VMs that fail to come up, and everything on an interrupt,
 # are torn down. Remove a fleet with scripts/teardown-fleet.sh.
 #
@@ -21,15 +23,18 @@
 #   --distros PATH        distros.tsv (default: <repo>/distros.tsv)
 #   --image-root PATH     shared image store (default: /mnt/media/iso/linux)
 #   --results-dir PATH    default: <repo>/results/fleet-<UTC ts>
-#   --work-dir PATH       per-VM disks; must be readable by libvirt's qemu
-#                         user (default: /tmp/distro-matrix-work)
+#   --work-dir PATH       per-VM disks (default: /tmp/distro-matrix-work)
+#   --backend B           qemu (through vm-run), libvirt, or auto (default:
+#                         qemu when vm-run, qemu-system-x86_64 and /dev/kvm
+#                         are available, else libvirt)
 #   --vcpus N             vCPUs per VM (default: 2)
 #   --memory MIB          RAM per VM (default: 2048)
 #   --disk GIB            disk size (default: 12)
 #   --boot-timeout SEC    per VM, including the FIPS reboot (default: 300)
 #   --ssh-key PATH        public key (default: first of id_ed25519/ecdsa/rsa;
 #                         FIPS guests reject ed25519, see --fips)
-#   --parallel N          VMs booting at once (default: 2)
+#   --parallel N|auto     VMs booting at once (default: auto: the vm-run
+#                         budget / --vcpus with qemu, 2 with libvirt)
 #   --connect URI         libvirt URI (default: qemu:///system)
 #   --fips                enable FIPS mode in each guest (EL9 and EL10)
 #
@@ -55,7 +60,8 @@ MEMORY=2048
 DISK=12
 BOOT_TIMEOUT=300
 SSH_KEY=$(dm_default_ssh_key || echo "$HOME/.ssh/id_ed25519.pub")
-PARALLEL=2
+PARALLEL=auto
+BACKEND=auto
 LIBVIRT_URI=qemu:///system
 FIPS=0
 
@@ -75,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --ssh-key) SSH_KEY=$2; shift 2 ;;
     --parallel) PARALLEL=$2; shift 2 ;;
     --connect) LIBVIRT_URI=$2; shift 2 ;;
+    --backend) BACKEND=$2; shift 2 ;;
     --fips) FIPS=1; shift ;;
     -h|--help) usage 0 ;;
     *) echo "unknown arg: $1" >&2; usage 2 ;;
@@ -112,7 +119,22 @@ DM_WORK_DIR=$WORK_DIR
 DM_LIBVIRT_URI=$LIBVIRT_URI
 # shellcheck disable=SC2034
 DM_SSH_KEY=$SSH_KEY
-BACKEND=libvirt
+case $BACKEND in
+  auto) if dm_qemu_available; then BACKEND=qemu; else BACKEND=libvirt; fi ;;
+  qemu) dm_qemu_available || { echo "qemu backend needs vm-run, qemu-system-x86_64 and a writable /dev/kvm" >&2; exit 2; } ;;
+  libvirt) ;;
+  *) echo "unknown --backend: $BACKEND (qemu|libvirt|auto)" >&2; exit 2 ;;
+esac
+if [[ $PARALLEL == auto ]]; then
+  if [[ $BACKEND == qemu ]]; then
+    budget=$(dm_vmrun_budget)
+    PARALLEL=$(( ${budget:-$VCPUS} / VCPUS ))
+    (( PARALLEL >= 1 )) || PARALLEL=1
+  else
+    PARALLEL=2
+  fi
+fi
+[[ $PARALLEL =~ ^[1-9][0-9]*$ ]] || { echo "--parallel must be a positive integer or auto" >&2; exit 2; }
 dm_init
 
 # alias -> "family \t expected_os_id \t qcow2_relpath"
@@ -139,7 +161,7 @@ done < "$MANIFEST"
 (( ${#VM_NAMES[@]} > 0 )) || { echo "manifest selects no VMs" >&2; exit 1; }
 
 log "fleet: ${#VM_NAMES[@]} VM(s), run $DM_RUN_ID: ${VM_NAMES[*]}"
-log "results: $RESULTS_DIR (vcpus $VCPUS, memory ${MEMORY}M, parallel $PARALLEL)"
+log "results: $RESULTS_DIR (backend $BACKEND, vcpus $VCPUS, memory ${MEMORY}M, parallel $PARALLEL)"
 
 # FIPS: portable across EL9 (fips-mode-setup) and EL10 (script removed:
 # apply the policy, add fips=1 to the kernel cmdline, and rebuild the
@@ -194,7 +216,7 @@ boot_one() {
     return 1
   fi
   local copy=0
-  if ! dm_world_readable "$qcow"; then
+  if [[ $BACKEND == libvirt ]] && ! dm_world_readable "$qcow"; then
     log "[$vm] base image isn't readable by libvirt's qemu user; copying"
     copy=1
   fi
@@ -202,7 +224,7 @@ boot_one() {
   dm_register "$BACKEND" "$vm" "$work"
   if ! { dm_stage_disk "$qcow" "$work" "$DISK" "$copy" \
          && dm_write_seed "$work" "$(dm_hostname "$alias")" "$SSH_KEY" "$FIPS_USERDATA" \
-         && dm_libvirt_create "$vm" "$work" "$VCPUS" "$MEMORY"; } >>"$out_dir/virt.log" 2>&1; then
+         && "dm_${BACKEND}_create" "$vm" "$work" "$VCPUS" "$MEMORY"; } >>"$out_dir/virt.log" 2>&1; then
     echo "FAIL create (see virt.log)" > "$out_dir/status"
     dm_destroy_vm "$BACKEND" "$vm" "$work"
     return 1
@@ -215,13 +237,13 @@ boot_one() {
   (( FIPS )) && ready='[ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ]'
   local deadline=$(( SECONDS + BOOT_TIMEOUT )) target host port
   while (( SECONDS < deadline )); do
-    target=$(dm_libvirt_target "$vm")
+    target=$("dm_${BACKEND}_target" "$vm")
     if [[ -n $target ]]; then
       read -r host port <<< "$target"
       if dm_ssh "$host" "$port" "$ready" </dev/null >/dev/null 2>&1; then
         if [[ $port == 22 ]]; then echo "$host" > "$out_dir/target"; else echo "$host:$port" > "$out_dir/target"; fi
         echo "OK $((SECONDS - started))s" > "$out_dir/status"
-        dm_keep "$vm"
+        dm_keep "$vm" "left running (fleet member; remove with teardown-fleet.sh)"
         log "[$vm] ready in $((SECONDS - started))s at $host:$port"
         return 0
       fi

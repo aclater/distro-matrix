@@ -92,7 +92,10 @@ dm_cleanup_all() {
     local backend vm work
     while IFS=$'\t' read -r backend vm work; do
       [[ -z $vm ]] && continue
-      [[ -e $DM_RESULTS_DIR/keep/$vm ]] && { dm_log "[$vm] kept for debugging"; continue; }
+      if [[ -e $DM_RESULTS_DIR/keep/$vm ]]; then
+        dm_log "[$vm] $(cat "$DM_RESULTS_DIR/keep/$vm" 2>/dev/null || true)"
+        continue
+      fi
       if "dm_${backend}_exists" "$vm"; then
         dm_log "[$vm] cleanup"
         dm_destroy_vm "$backend" "$vm" "$work"
@@ -104,8 +107,13 @@ dm_cleanup_all() {
   exit "$rc"
 }
 
-# Mark a VM so dm_cleanup_all leaves it running (--keep-on-failure).
-dm_keep() { mkdir -p "$DM_RESULTS_DIR/keep"; : > "$DM_RESULTS_DIR/keep/$1"; }
+# dm_keep VM [REASON]: dm_cleanup_all leaves VM running and logs REASON
+# (run-matrix --keep-on-failure keeps failed VMs for debugging; spawn-fleet
+# keeps every VM that came up, on purpose).
+dm_keep() {
+  mkdir -p "$DM_RESULTS_DIR/keep"
+  printf '%s\n' "${2:-left running (kept for debugging)}" > "$DM_RESULTS_DIR/keep/$1"
+}
 
 # --- Images ----------------------------------------------------------------
 
