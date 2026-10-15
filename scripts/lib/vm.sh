@@ -11,8 +11,8 @@
 #     signal (#20);
 #   - image resolution: the local cache (~/.cache/pqc-vm-matrix) by alias,
 #     then --image-root (#22);
-#   - backends: libvirt (virt-install + cloud-localds); a vm-run backend is
-#     added in #21.
+#   - backends: libvirt (virt-install + cloud-localds) and qemu, launched
+#     through vm-run (#21) or, with DM_QEMU_DIRECT=1, directly (CI, #46).
 #
 # Callers set DM_RESULTS_DIR, DM_WORK_DIR, DM_LIBVIRT_URI and DM_SSH_KEY
 # (public key path) before calling dm_init.
@@ -274,6 +274,13 @@ dm_qemu_available() {
   command -v vm-run >/dev/null && command -v qemu-system-x86_64 >/dev/null && [[ -w /dev/kvm ]]
 }
 
+# qemu-direct (#46): the same qemu backend without vm-run, for CI runners and
+# hosts that don't have it. Opt-in only (--backend qemu-direct); `auto` never
+# picks it, because it bypasses the host's vCPU budget. KVM when /dev/kvm is
+# writable, else TCG (slow: raise --boot-timeout).
+DM_QEMU_DIRECT=${DM_QEMU_DIRECT:-0}
+dm_qemu_direct_available() { command -v qemu-system-x86_64 >/dev/null; }
+
 # vm-run's current budget in vCPUs ("vCPU in use: X / N"), or empty.
 # awk reads to the end: exiting early would SIGPIPE vm-run, and with
 # pipefail + set -e that kills the caller.
@@ -303,12 +310,17 @@ dm_qemu_create() {
   fi
   port=$(dm_free_port)
   echo "$port" > "$work/ssh-port"
+  local launch=(vm-run --name "$vm") accel=(-machine "q35,accel=kvm" -cpu host)
+  if (( DM_QEMU_DIRECT )); then
+    launch=()
+    [[ -w /dev/kvm ]] || accel=(-machine "q35,accel=tcg" -cpu max)
+  fi
   # cidata as a virtio disk, as with libvirt: some cloud kernels (Debian 12)
   # can't see a SATA CD-ROM (#3). vm-run blocks here until the VM fits the
   # budget; the caller's boot timeout starts after this returns.
-  vm-run --name "$vm" qemu-system-x86_64 \
+  "${launch[@]}" qemu-system-x86_64 \
     -name "$vm" \
-    -machine q35,accel=kvm -cpu host \
+    "${accel[@]}" \
     -smp "$vcpus" -m "$mem" \
     -drive "file=$work/disk.qcow2,if=virtio,format=qcow2" \
     -drive "file=$work/cidata.iso,if=virtio,format=raw,readonly=on" \
