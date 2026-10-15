@@ -3,7 +3,8 @@
 # smaller than its base image. Needs only qemu-img; no VM is booted.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/lib/vm.sh
+# Followed with `shellcheck -x`; plain runs (pre-commit) skip the sourced file.
+# shellcheck source=../scripts/lib/vm.sh disable=SC1091
 source "$here/../scripts/lib/vm.sh"
 
 tmp=$(mktemp -d)
