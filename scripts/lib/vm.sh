@@ -165,15 +165,30 @@ EOF
   cloud-localds "$work/cidata.iso" "$work/user-data" "$work/meta-data"
 }
 
+# Virtual size of a disk image in bytes.
+dm_image_bytes() {
+  qemu-img info --output=json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["virtual-size"])'
+}
+
 # dm_stage_disk BASE WORK DISK_GIB COPY(0|1) -> creates WORK/disk.qcow2
+# The disk is DISK_GIB or the base image's own size, whichever is larger. An
+# overlay smaller than its backing image truncates the guest's disk: Oracle
+# Linux (37 GiB) and Amazon Linux 2023 (25 GiB) then lose the end of their
+# root volume and hang in the initramfs (#43); and qemu-img resize refuses
+# to shrink a copy.
 dm_stage_disk() {
-  local base=$1 work=$2 gib=$3 copy=$4
+  local base=$1 work=$2 gib=$3 copy=$4 src want have
+  src=$(readlink -f "$base")
+  want=$(( gib * 1024 * 1024 * 1024 ))
+  have=$(dm_image_bytes "$src")
+  (( have > want )) && want=$have
   if (( copy )); then
-    cp --reflink=auto "$(readlink -f "$base")" "$work/disk.qcow2"
-    qemu-img resize -q "$work/disk.qcow2" "${gib}G"
+    cp --reflink=auto "$src" "$work/disk.qcow2"
+    (( want > have )) && qemu-img resize -q "$work/disk.qcow2" "$want"
   else
-    qemu-img create -q -f qcow2 -F qcow2 -b "$(readlink -f "$base")" "$work/disk.qcow2" "${gib}G"
+    qemu-img create -q -f qcow2 -F qcow2 -b "$src" "$work/disk.qcow2" "$want"
   fi
+  return 0
 }
 
 # --- libvirt backend -------------------------------------------------------
