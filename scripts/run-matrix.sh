@@ -46,6 +46,15 @@
 #                             difference count goes in the report; it doesn't
 #                             change the verdict.
 #   --compare-args 'STR'      Args for the compare scanner (default: --scanner-args)
+#   --prepare FILE            alias|family|*<TAB>command lines run as root on
+#                             each matching guest after SSH is up and before
+#                             the scanner (output: <alias>/prepare.log). A
+#                             command may write an interpreter path to
+#                             /etc/distro-matrix/interpreter; both scanners
+#                             then run as `<interpreter> scanner`. Example:
+#                             prepare/pqc-readiness.tsv (Python 3.9+ on EL8,
+#                             Leap 15.6). A failing command fails the distro.
+#   --prepare-timeout SEC     Max seconds per prepare command (default: 900)
 #   --ground-truth FILE       name<TAB>command lines run as root on each guest
 #                             after the scan; output saved to
 #                             <alias>/ground-truth/<name>.txt. Example:
@@ -103,6 +112,8 @@ PARALLEL=auto
 BACKEND=auto
 NO_BACKING=0
 KEEP_ON_FAILURE=0
+PREPARE=""
+PREPARE_TIMEOUT=900
 LIBVIRT_URI=qemu:///system
 
 usage() { sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -131,6 +142,8 @@ while [[ $# -gt 0 ]]; do
     --backend) BACKEND=$2; shift 2 ;;
     --no-backing) NO_BACKING=1; shift ;;
     --keep-on-failure) KEEP_ON_FAILURE=1; shift ;;
+    --prepare) PREPARE=$2; shift 2 ;;
+    --prepare-timeout) PREPARE_TIMEOUT=$2; shift 2 ;;
     --connect) LIBVIRT_URI=$2; shift 2 ;;
     --help|-h) usage 0 ;;
     *) echo "unknown arg: $1" >&2; usage 2 ;;
@@ -164,6 +177,8 @@ if [[ $PARALLEL == auto ]]; then
   fi
 fi
 [[ $PARALLEL =~ ^[1-9][0-9]*$ ]] || { echo "--parallel must be a positive integer or auto" >&2; exit 2; }
+[[ -z $PREPARE || -r $PREPARE ]] || { echo "prepare file not readable: $PREPARE" >&2; exit 2; }
+[[ $PREPARE_TIMEOUT =~ ^[1-9][0-9]*$ ]] || { echo "--prepare-timeout must be a positive integer" >&2; exit 2; }
 for cmd in "${need[@]}"; do
   command -v "$cmd" >/dev/null || { echo "missing required tool: $cmd" >&2; exit 2; }
 done
@@ -247,6 +262,9 @@ run_one() {
     if (( ! recorded )); then
       fail "aborted during: $step (exit $rc; see $out_dir/virt.log)"
     fi
+    # The guest's serial console is the only way to see why a VM never came
+    # up (#43); keep it with the results before the work dir goes.
+    [[ -s $work/console.log ]] && cp "$work/console.log" "$out_dir/console.log" 2>/dev/null
     if [[ $(cut -f6 "$out_dir/record.tsv" 2>/dev/null) == FAIL && $KEEP_ON_FAILURE -eq 1 ]]; then
       dm_keep "$vm"
       log "[$alias] keeping $vm + $work (debug)"
@@ -261,7 +279,7 @@ run_one() {
   local qcow
   step="resolve image"
   if ! qcow=$(dm_resolve_image "$alias" "${QCOW_RELPATHS[$idx]}" "$IMAGE_ROOT"); then
-    fail "image not found: $alias (cache $DM_IMAGE_CACHE/images, root $IMAGE_ROOT/${QCOW_RELPATHS[$idx]})"
+    fail "image not found locally: $alias (not in $DM_IMAGE_CACHE/images, not at $IMAGE_ROOT/${QCOW_RELPATHS[$idx]}; is the image store mounted?)"
     return
   fi
   log "[$alias] image $qcow"
@@ -293,12 +311,30 @@ run_one() {
   read -r host port <<< "$target"
   log "[$alias] ssh $host:$port"
 
+  if [[ -n $PREPARE ]]; then
+    step="prepare guest"
+    local p_key p_cmd
+    while IFS=$'\t' read -r p_key p_cmd; do
+      [[ -z $p_key || $p_key == \#* || -z $p_cmd ]] && continue
+      [[ $p_key == "$alias" || $p_key == "${FAMILIES[$idx]}" || $p_key == '*' ]] || continue
+      log "[$alias] prepare: $p_cmd"
+      printf '### %s\n' "$p_cmd" >> "$out_dir/prepare.log"
+      # base64 so the command reaches the guest's bash byte for byte; stdin
+      # from /dev/null so ssh doesn't swallow the rest of the file.
+      if ! dm_ssh "$host" "$port" "sudo mkdir -p /etc/distro-matrix && echo $(printf '%s' "$p_cmd" | base64 -w0) | base64 -d | sudo timeout ${PREPARE_TIMEOUT}s bash" \
+          < /dev/null >> "$out_dir/prepare.log" 2>&1; then
+        fail "prepare failed: $p_cmd (see $out_dir/prepare.log)"
+        return
+      fi
+    done < "$PREPARE"
+  fi
+
   step="run scanner"
   log "[$alias] pushing scanner + running"
   dm_scp_to "$host" "$port" "$SCANNER" /tmp/scanner >>"$out_dir/virt.log" 2>&1
   dm_ssh "$host" "$port" "
     sudo install -m 0755 /tmp/scanner /usr/local/bin/scanner
-    timeout ${SCANNER_TIMEOUT}s sudo /usr/local/bin/scanner $SCANNER_ARGS > /tmp/result.json 2> /tmp/stderr.log
+    timeout ${SCANNER_TIMEOUT}s sudo \$(cat /etc/distro-matrix/interpreter 2>/dev/null) /usr/local/bin/scanner $SCANNER_ARGS > /tmp/result.json 2> /tmp/stderr.log
     echo \$? > /tmp/exit-code
     sudo cp /etc/os-release /tmp/os-release
     sudo chown matrix: /tmp/result.json /tmp/stderr.log /tmp/exit-code /tmp/os-release
@@ -316,7 +352,7 @@ run_one() {
     dm_scp_to "$host" "$port" "$COMPARE_SCANNER" /tmp/scanner-b >>"$out_dir/virt.log" 2>&1
     dm_ssh "$host" "$port" "
       sudo install -m 0755 /tmp/scanner-b /usr/local/bin/scanner-b
-      timeout ${SCANNER_TIMEOUT}s sudo /usr/local/bin/scanner-b $COMPARE_ARGS > /tmp/result-b.json 2> /tmp/stderr-b.log
+      timeout ${SCANNER_TIMEOUT}s sudo \$(cat /etc/distro-matrix/interpreter 2>/dev/null) /usr/local/bin/scanner-b $COMPARE_ARGS > /tmp/result-b.json 2> /tmp/stderr-b.log
       echo \$? > /tmp/exit-code-b
       sudo chown matrix: /tmp/result-b.json /tmp/stderr-b.log /tmp/exit-code-b
     " 2>>"$out_dir/virt.log" || true

@@ -31,3 +31,15 @@ jobs:
           # no-commit-to-branch guards local commits; on a push to main
           # it would always fail (#25).
           SKIP: no-commit-to-branch
+
+  tests:
+    name: Offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install qemu-img
+        run: sudo apt-get update -q && sudo apt-get install -y -q qemu-utils
+      - name: Run tests/*.sh
+        run: |
+          set -e
+          for t in tests/*.sh; do echo "== $t"; bash "$t"; done

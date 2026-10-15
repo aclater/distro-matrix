@@ -24,19 +24,21 @@ its output back and writes `results/<UTC ts>/report.md` and `summary.json`.
 `--image-root`) and two backends. `--backend qemu` (the default when `vm-run`
 is on PATH) launches each VM through `vm-run` with user-mode networking;
 `--backend libvirt` uses `virt-install` on `qemu:///system`. `run-matrix.sh`
-can also validate results against a schema (`--schema`), diff two scanner
-builds on the same VM (`--compare-scanner`) and capture ground-truth command
-output (`--ground-truth`).
+can also prepare guests before the scan (`--prepare`, e.g. Python 3.11 on
+EL8 and Leap 15.6), validate results against a schema (`--schema`), diff two
+scanner builds on the same VM (`--compare-scanner`) and capture ground-truth
+command output (`--ground-truth`). `spawn-fleet.sh` takes the same
+`--backend`. Each distro's serial console is saved as `<alias>/console.log`
+(qemu backend): read it first when a VM never comes up on SSH.
 
 ## Rules that matter here
 
 - **Respect the host's VM budget.** Unthrottled parallel VMs crashed the
   maintainer's laptop on 2026-10-14. `~/.local/bin/vm-run` admits VMs against
   a vCPU budget (12 while the `crc` VM runs, 18 otherwise). Use the qemu
-  backend with `--parallel auto`, which follows that budget. libvirt VMs
-  bypass it (#39 tracks moving spawn-fleet to the qemu backend): with
-  `--backend libvirt` or spawn-fleet, keep to 1-2 VMs of 1-2 vCPUs and check
-  `vm-run --status` and `virsh list` first.
+  backend (run-matrix and spawn-fleet) with `--parallel auto`, which follows
+  that budget. libvirt VMs bypass it: with `--backend libvirt`, keep to 1-2
+  VMs of 1-2 vCPUs and check `vm-run --status` and `virsh list` first.
 - **Never destroy a VM you didn't create.** Other runs (or OpenShift Local,
   VM `crc`) may share the hypervisor. Clean up your own VMs and work dirs,
   even on failure.
@@ -53,7 +55,8 @@ output (`--ground-truth`).
 
 ```bash
 pre-commit run --all-files     # includes shellcheck and detect-secrets
-shellcheck -s bash scripts/*.sh scripts/spawn-fleet/*.sh
+shellcheck -s bash -e SC1091 scripts/*.sh scripts/lib/*.sh scripts/spawn-fleet/*.sh tests/*.sh
+for t in tests/*.sh; do bash "$t"; done   # offline tests (need qemu-img)
 ruff check scripts/ tools/
 ```
 

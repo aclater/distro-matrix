@@ -75,24 +75,43 @@ dm_destroy_vm() {
   fi
 }
 
-# Tear down everything this run registered. Children first: async jobs in
-# a non-interactive shell ignore SIGINT, so they would otherwise keep
-# booting VMs after the parent is gone.
+# Send SIG to PID and every descendant, children first.
+dm_kill_tree() {
+  local sig=$1 pid=$2 c
+  for c in $(pgrep -P "$pid" 2>/dev/null); do
+    dm_kill_tree "$sig" "$c"
+  done
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+
+# Tear down everything this run registered. Children first, as whole
+# process trees: async jobs in a non-interactive shell ignore SIGINT, and
+# the ssh/scp they run inherit that, so Ctrl-C reaches none of them. A
+# subshell also defers its TERM trap until its foreground ssh exits, which
+# can be minutes (a --prepare dnf, a scanner run). Terminating the trees
+# makes an interrupt take seconds, not the remaining command time.
 dm_cleanup_all() {
   local rc=$?
   trap - EXIT INT TERM
-  local pids
+  local pids p _
   pids=$(jobs -p)
   if [[ -n $pids ]]; then
-    # shellcheck disable=SC2086  # word-split the PID list on purpose
-    kill -TERM $pids 2>/dev/null || true
+    for p in $pids; do dm_kill_tree TERM "$p"; done
+    for _ in $(seq 1 20); do
+      jobs -pr | grep -q . || break
+      sleep 0.5
+    done
+    for p in $(jobs -pr); do dm_kill_tree KILL "$p"; done
     wait 2>/dev/null || true
   fi
   if [[ -s ${DM_REGISTRY:-} ]]; then
     local backend vm work
     while IFS=$'\t' read -r backend vm work; do
       [[ -z $vm ]] && continue
-      [[ -e $DM_RESULTS_DIR/keep/$vm ]] && { dm_log "[$vm] kept for debugging"; continue; }
+      if [[ -e $DM_RESULTS_DIR/keep/$vm ]]; then
+        dm_log "[$vm] $(cat "$DM_RESULTS_DIR/keep/$vm" 2>/dev/null || true)"
+        continue
+      fi
       if "dm_${backend}_exists" "$vm"; then
         dm_log "[$vm] cleanup"
         dm_destroy_vm "$backend" "$vm" "$work"
@@ -104,8 +123,13 @@ dm_cleanup_all() {
   exit "$rc"
 }
 
-# Mark a VM so dm_cleanup_all leaves it running (--keep-on-failure).
-dm_keep() { mkdir -p "$DM_RESULTS_DIR/keep"; : > "$DM_RESULTS_DIR/keep/$1"; }
+# dm_keep VM [REASON]: dm_cleanup_all leaves VM running and logs REASON
+# (run-matrix --keep-on-failure keeps failed VMs for debugging; spawn-fleet
+# keeps every VM that came up, on purpose).
+dm_keep() {
+  mkdir -p "$DM_RESULTS_DIR/keep"
+  printf '%s\n' "${2:-left running (kept for debugging)}" > "$DM_RESULTS_DIR/keep/$1"
+}
 
 # --- Images ----------------------------------------------------------------
 
@@ -165,15 +189,30 @@ EOF
   cloud-localds "$work/cidata.iso" "$work/user-data" "$work/meta-data"
 }
 
+# Virtual size of a disk image in bytes.
+dm_image_bytes() {
+  qemu-img info --output=json "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["virtual-size"])'
+}
+
 # dm_stage_disk BASE WORK DISK_GIB COPY(0|1) -> creates WORK/disk.qcow2
+# The disk is DISK_GIB or the base image's own size, whichever is larger. An
+# overlay smaller than its backing image truncates the guest's disk: Oracle
+# Linux (37 GiB) and Amazon Linux 2023 (25 GiB) then lose the end of their
+# root volume and hang in the initramfs (#43); and qemu-img resize refuses
+# to shrink a copy.
 dm_stage_disk() {
-  local base=$1 work=$2 gib=$3 copy=$4
+  local base=$1 work=$2 gib=$3 copy=$4 src want have
+  src=$(readlink -f "$base")
+  want=$(( gib * 1024 * 1024 * 1024 ))
+  have=$(dm_image_bytes "$src")
+  (( have > want )) && want=$have
   if (( copy )); then
-    cp --reflink=auto "$(readlink -f "$base")" "$work/disk.qcow2"
-    qemu-img resize -q "$work/disk.qcow2" "${gib}G"
+    cp --reflink=auto "$src" "$work/disk.qcow2"
+    (( want > have )) && qemu-img resize -q "$work/disk.qcow2" "$want"
   else
-    qemu-img create -q -f qcow2 -F qcow2 -b "$(readlink -f "$base")" "$work/disk.qcow2" "${gib}G"
+    qemu-img create -q -f qcow2 -F qcow2 -b "$src" "$work/disk.qcow2" "$want"
   fi
+  return 0
 }
 
 # --- libvirt backend -------------------------------------------------------

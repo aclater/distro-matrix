@@ -1,0 +1,14 @@
+# Guest preparation for the pqc-readiness scanner (run-matrix.sh --prepare).
+# key<TAB>command: key is a distros.tsv alias, a family, or *. Commands run
+# as root after SSH is up, before the scanner; a failure fails the distro.
+# pqc-readiness needs Python 3.9+. EL8 and Leap 15 ship 3.6 (or no python3),
+# so install a newer one, as pqc-readiness's README tells users, and point
+# the runner at it through /etc/distro-matrix/interpreter.
+#
+# EL 8.8+ has python3.11 in AppStream. rhel8 needs a registered system (or
+# a local repo) for dnf to reach it.
+alma8	dnf -y -q install python3.11 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter
+rocky8	dnf -y -q install python3.11 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter
+ol8	dnf -y -q install python3.11 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter
+rhel8	dnf -y -q install python3.11 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter
+leap156	zypper -n -q --gpg-auto-import-keys install python311 && echo /usr/bin/python3.11 > /etc/distro-matrix/interpreter
