@@ -279,7 +279,7 @@ run_one() {
   local qcow
   step="resolve image"
   if ! qcow=$(dm_resolve_image "$alias" "${QCOW_RELPATHS[$idx]}" "$IMAGE_ROOT"); then
-    fail "image not found: $alias (cache $DM_IMAGE_CACHE/images, root $IMAGE_ROOT/${QCOW_RELPATHS[$idx]})"
+    fail "image not found locally: $alias (not in $DM_IMAGE_CACHE/images, not at $IMAGE_ROOT/${QCOW_RELPATHS[$idx]}; is the image store mounted?)"
     return
   fi
   log "[$alias] image $qcow"

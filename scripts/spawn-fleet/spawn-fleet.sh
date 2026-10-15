@@ -211,7 +211,7 @@ boot_one() {
 
   local qcow
   if ! qcow=$(dm_resolve_image "$alias" "${VM_RELPATHS[$idx]}" "$IMAGE_ROOT"); then
-    echo "FAIL image not found for $alias" > "$out_dir/status"
+    echo "FAIL image not found locally for $alias (not in the cache or under $IMAGE_ROOT)" > "$out_dir/status"
     log "[$vm] image not found"
     return 1
   fi
