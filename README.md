@@ -48,6 +48,7 @@ test-on-distros --scanner ./dist/pqc-readiness.pyz --scanner-args '--json' --onl
 - **`--backend qemu`** (the default when `~/.local/bin/vm-run`, `qemu-system-x86_64` and `/dev/kvm` are available) launches each VM through `vm-run`. Every VM is admitted against the host's vCPU budget and queued until it fits, and it runs in the capped `pqc-vms.slice`. Networking is user-mode with an SSH forward on `127.0.0.1`, so there's no libvirt and no root. `--parallel auto` (the default) is the budget divided by `--vcpus`.
 - **`--backend libvirt`** uses `virt-install` on `--connect` (default `qemu:///system`) and the default network, as before. These VMs bypass `vm-run`, so `--parallel auto` means 1; keep it at 1-2 on a shared workstation.
 - **Images** resolve from the local cache first (`~/.cache/pqc-vm-matrix/images/<alias>.qcow2`, override with `DM_IMAGE_CACHE`), then from `--image-root`, which is optional. With libvirt, a base image its qemu user can't read (such as anything under `~/.cache`) is copied instead of overlaid automatically.
+- **Disks** are `--disk` GiB or the base image's own size, whichever is larger. Some vendor images are big (Oracle Linux 37 GiB, Amazon Linux 2023 25 GiB); a smaller overlay would truncate them and the guest would hang in its initramfs (#43).
 - **The SSH key** defaults to the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub` and `id_rsa.pub`.
 - **Every VM is named `dm-<run-id>-<alias>`.** Concurrent runs never collide, and a run only ever destroys VMs it created. Ctrl-C, TERM or an error tears down everything the run started, and each unfinished distro is recorded as FAIL with the step it was in.
 
@@ -55,18 +56,19 @@ test-on-distros --scanner ./dist/pqc-readiness.pyz --scanner-args '--json' --onl
 
 - **`--schema schemas/pqc-readiness-report.schema.json`** validates each `result.json`; a violation fails that distro and the errors land in `<alias>/schema-A.txt`. The bundled schema is structural: it checks the fields the matrix and its consumers rely on, since pqc-readiness doesn't publish a report schema. It uses `python3-jsonschema` when importable (set `DM_PYTHON` to choose the interpreter), else a small built-in validator for the subset the schema uses.
 - **`--compare-scanner PATH`** runs a second scanner build on the same booted VM and writes `<alias>/compare.json`, a JSON diff that ignores timestamps and benchmark numbers. The difference count goes in the report's Notes; it doesn't change the verdict. This is the before/after check for a scanner change.
+- **`--prepare prepare/pqc-readiness.tsv`** runs each matching `key<TAB>command` line as root after SSH is up and before the scanner; `key` is an alias, a family from `distros.tsv`, or `*`. Output goes to `<alias>/prepare.log`, and a failing command fails the distro with its own reason. A command may write an interpreter path to `/etc/distro-matrix/interpreter`; both scanners then run as `<interpreter> scanner` instead of through their shebang. The pqc-readiness file installs Python 3.11 on EL8 (alma8, rocky8, ol8, rhel8) and Leap 15.6, whose Python 3.6 (or missing `python3`) can't run it. Preparation adds 3-5 minutes per guest, mostly package metadata. `--prepare-timeout` caps each command (default 900 s).
 - **`--ground-truth ground-truth/pqc-readiness.tsv`** runs each `name<TAB>command` line as root on the guest after the scan and saves `<alias>/ground-truth/<name>.txt`: `ssh -Q kex`, `sshd -T`, `openssl list`, the crypto policy, rpm/dpkg package lists. That's what the scanner's output should agree with.
 
 ## Keep-alive fleets — `spawn-fleet.sh`
 
-`run-matrix.sh` is one-shot: boot, scan, destroy. For workflows that want VMs to *stay alive* (driving them with Ansible, running multi-step playbooks, comparing per-host results across reboots), use `scripts/spawn-fleet/spawn-fleet.sh`. It's built on the same `scripts/lib/vm.sh` as the runner, so VMs carry a run ID, images come from the local cache before `--image-root`, and no `sudo` is needed (be in the `libvirt` group). Unlike the runner, it:
+`run-matrix.sh` is one-shot: boot, scan, destroy. For workflows that want VMs to *stay alive* (driving them with Ansible, running multi-step playbooks, comparing per-host results across reboots), use `scripts/spawn-fleet/spawn-fleet.sh`. It's built on the same `scripts/lib/vm.sh` as the runner, so VMs carry a run ID, images come from the local cache before `--image-root`, and no `sudo` is needed. It takes the same `--backend`: the default qemu backend runs every fleet VM through `vm-run` inside the host's budget, with targets like `127.0.0.1:37191`; `--backend libvirt` needs the `libvirt` group and bypasses the budget. Unlike the runner, it:
 
 - reads a manifest of `alias COUNT` pairs (aliases from `distros.tsv`) instead of `--only`;
 - runs no scanner: each VM that comes up is left running, and a VM that doesn't is torn down;
 - writes `inventory.ini` (Ansible INI, grouped by distro family and alias) and `fleet.tsv` (vm / alias / family / expected_id / host[:port]);
 - names VMs `dm-<run-id>-<alias>-NN`, so fleets and matrix runs coexist on one hypervisor.
 
-Defaults are 2 vCPU, 2 GiB and 2 VMs booting at once; size `--parallel` to the host. FIPS guests reject ed25519 keys, so `--fips` needs an RSA or ECDSA `--ssh-key` (`scripts/fips-divergence.sh` generates one per run).
+Defaults are 2 vCPU and 2 GiB per VM; `--parallel auto` follows the `vm-run` budget with qemu and means 2 with libvirt. VMs that came up are logged as "left running (fleet member; remove with teardown-fleet.sh)" when the script exits. FIPS guests reject ed25519 keys, so `--fips` needs an RSA or ECDSA `--ssh-key` (`scripts/fips-divergence.sh` generates one per run).
 
 ```bash
 printf 'rocky9 2\ndebian12 1\n' > fleet.txt
@@ -99,35 +101,30 @@ ExecStart=/usr/bin/libvirtd
 ## How a VM is built
 
 ```
-upstream qcow2 (NFS, read-only)
+base image (local cache, or the shared store)
         │
-        │  qemu-img create -F qcow2 -b ...   (thin overlay; fast)
-        ▼
-   work/disk.qcow2  ──┐
-                      │
-   user-data ──┐      │
-   meta-data ──┴──> cloud-localds cidata.iso
-                      │
-                      ▼
-   virt-install --import \
-     --disk path=work/disk.qcow2 \
-     --disk path=work/cidata.iso,device=cdrom \
-     --network network=default
-                      │
-                      ▼
-   libvirt boots VM ──> cloud-init reads cidata.iso (NoCloud datasource)
-                                │
-                                ▼
-                        creates `matrix` user (sudo NOPASSWD, our SSH key)
-                                │
-                                ▼
-                        runner waits for IPv4, SSHes in, runs scanner
-                                │
-                                ▼
-                        SCP result.json / stderr.log / exit-code back
-                                │
-                                ▼
-                        cleanup: virsh destroy + undefine, rm work dir
+        │  qemu-img create -F qcow2 -b ...  (thin overlay, never smaller than the base;
+        │                                     a full copy with libvirt if its qemu user
+        ▼                                     can't read the base)
+   work/disk.qcow2 ──┐
+                     │
+   user-data ──┐     │
+   meta-data ──┴──> cloud-localds cidata.iso (attached as a read-only virtio disk:
+                     │                        some cloud kernels have no SATA/AHCI driver, #3)
+                     ▼
+   qemu backend:    vm-run qemu-system-x86_64 -machine q35,accel=kvm ...
+                    (user-mode network, SSH forwarded to 127.0.0.1:<port>,
+                     serial console to work/console.log)
+   libvirt backend: virt-install --import ... --network network=default
+                     │
+                     ▼
+   cloud-init reads the seed (NoCloud) ──> `matrix` user, sudo NOPASSWD, our SSH key
+                     │
+                     ▼
+   runner waits for SSH ──> --prepare ──> scanner (and --compare-scanner) ──> --ground-truth
+                     │
+                     ▼
+   copy results back, plus console.log ──> destroy the VM, remove its work dir
 ```
 
 ## Verdict semantics
@@ -200,8 +197,8 @@ This used to be a scheduled workflow, but it needed a self-hosted libvirt runner
 
 ## Known issues
 
-- **debian12** boots but never acquires a DHCPv4 lease — root cause TBD. Tracked in [#3](https://github.com/aclater/distro-matrix/issues/3). Currently commented out in `distros.tsv`.
-- **EL8 family** scanners that use `#!/usr/bin/env python3` will exit 127 — RHEL/Rocky/AlmaLinux 8 cloud images ship `python3.6`/`python3.8` without the `/usr/bin/python3` symlink (operator must `dnf install python3` or `alternatives --set python3`). Not a `distro-matrix` bug, but matrix runs against scanners with this assumption will FAIL on EL8 — see [pqc-readiness#36](https://github.com/aclater/pqc-readiness/issues/36) for the canonical bug-report shape.
+- **RHEL images live only on the shared store**, so `rhel8`, `rhel9` and `rhel10` (and the RHEL half of `scripts/fips-divergence.sh`) need `--image-root /mnt/media/iso/linux` at home (#38). Away from it they fail at once with "image not found locally".
+- **`rhel8` preparation** needs a registered system (or a local repo) for `dnf install python3.11`.
 
 ## Output layout
 
@@ -215,7 +212,13 @@ results/
       stderr.log         ← scanner stderr
       exit-code          ← scanner exit code
       os-release         ← guest /etc/os-release (ground truth)
-      virt.log           ← virt-install + virsh + scp output
+      virt.log           ← disk staging, VM creation and scp output
+      console.log        ← the guest's serial console (qemu backend); read this when a VM never comes up
+      prepare.log        ← --prepare commands and their output
+      result-b.json      ← --compare-scanner stdout (also stderr-b.log, exit-code-b)
+      compare.json       ← --compare-scanner diff
+      schema-A.txt       ← --schema result (schema-B.txt for the compare build)
+      ground-truth/      ← --ground-truth command output, one file per name
       record.tsv         ← per-distro tab-separated record (parallelism-safe aggregation)
 ```
 
