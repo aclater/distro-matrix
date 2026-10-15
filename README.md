@@ -146,7 +146,7 @@ The matrix's job is *"did the script run on this OS"*, not *"what verdict did th
 
 NFS-mounted qcow2s, 10 GbE direct between lennon and the storage host. The thin backing-file overlay means VM startup reads the base image lazily over NFS — no per-VM copy.
 
-On a laptop (24-core Framework, local images, qemu backend, 18-vCPU vm-run budget), all 18 cached distros ran with a compare build, schema checks, ground truth and `--prepare` in 4 min 27 s (2026-10-15); most distros take 20-45 s, and the four that need `--prepare` 3-5 minutes. The full results and the rest of the checklist are in [docs/verification/2026-10-15.md](docs/verification/2026-10-15.md).
+On a laptop (24-core Framework, local images, qemu backend, 18-vCPU vm-run budget), all 18 cached distros ran with a compare build, schema checks, ground truth and `--prepare` in 4 min 27 s (2026-10-15); most distros take 20-45 s, and the four that need `--prepare` 3-5 minutes. The full results and the rest of the checklist are in [docs/verification/2026-10-15.md](docs/verification/2026-10-15.md). With every image in the local cache (RHEL and the other store-only images copied in), **22 of the 23 distros in `distros.tsv` pass** in 3 min 46 s; `rhel8` fails in preparation until #58 lands ([docs/verification/2026-10-15-full-matrix.md](docs/verification/2026-10-15-full-matrix.md)).
 
 ## Supported distros
 
@@ -210,12 +210,14 @@ scripts/fips-divergence.sh --pqc-readiness ./pqc-readiness.pyz --image-root /mnt
 
 FIPS sshd rejects ed25519 keys, so each run generates a throwaway RSA key in its results directory. RHEL images need a Red Hat login and usually live only on the shared image store. Without one, the RHEL half is skipped with a message, and the script exits 3 so a partial run isn't mistaken for a pass. Exit codes: 0 divergence holds; 1 or 2 divergence broken (see the assertion script); 3 partial run; 4 setup or fleet failure.
 
+**Last verified 2026-10-15** with pqc-readiness 2.4.0 ([details](docs/verification/2026-10-15-full-matrix.md)): RHEL 10.1 under FIPS reported 0 PQC KEMs and 0 PQC signatures; Rocky Linux 10.2 under FIPS reported 3 KEMs (ML-KEM-512/768/1024) and 15 signature algorithms. The divergence holds in both directions (exit 0).
+
 This used to be a scheduled workflow, but it needed a self-hosted libvirt runner that was never registered, so every run was cancelled (#28).
 
 ## Known issues
 
-- **RHEL images live only on the shared store**, so `rhel8`, `rhel9` and `rhel10` (and the RHEL half of `scripts/fips-divergence.sh`) need `--image-root /mnt/media/iso/linux` at home (#38). Away from it they fail at once with "image not found locally".
-- **`rhel8` preparation** needs a registered system (or a local repo) for `dnf install python3.11`.
+- **RHEL images need a Red Hat login to download** and live on the shared image store. Copy them once into the local cache (`~/.cache/pqc-vm-matrix/images/rhel8.qcow2` etc.) and they work anywhere, or pass `--image-root /mnt/media/iso/linux` at home. Without either, `rhel8`, `rhel9` and `rhel10` fail at once with "image not found locally".
+- **`rhel8` preparation fails on the unregistered cloud image:** it has no enabled repositories, so `dnf install python3.11` can't run (#58, which proposes the UBI 8 repositories or an activation key). `rhel9` and `rhel10` need no preparation and pass.
 
 ## Output layout
 
